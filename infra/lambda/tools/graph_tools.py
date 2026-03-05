@@ -1,0 +1,353 @@
+"""8 Graph RAG tools for Lambda -- plain functions (no @tool decorator).
+
+Reuses the Gremlin query logic from the agent tools but returns raw
+JSON strings suitable for the Lambda handler response.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+
+from gremlin_python.process.graph_traversal import __
+from gremlin_python.process.traversal import P, TextP, Order
+
+from graph_client import get_connection, map_to_dict, parse_json_field
+
+logger = logging.getLogger(__name__)
+
+
+# -------------------------------------------------------------------------
+# 1. get_package
+# -------------------------------------------------------------------------
+def get_package(package_code: str) -> str:
+    """Retrieve complete package information including related entities."""
+    g = get_connection()
+
+    pkg_maps = (
+        g.V()
+        .hasLabel("Package")
+        .has("code", package_code)
+        .valueMap(True)
+        .toList()
+    )
+    if not pkg_maps:
+        return json.dumps({"error": f"Package '{package_code}' not found"}, ensure_ascii=False)
+
+    package = map_to_dict(pkg_maps[0])
+    for field in ("season", "hashtags", "guide_fee"):
+        if field in package:
+            package[field] = parse_json_field(package[field])
+
+    cities = (
+        g.V().hasLabel("Package").has("code", package_code)
+        .outE("VISITS")
+        .project("city", "day", "order")
+        .by(__.inV().valueMap(True))
+        .by(__.values("day").fold())
+        .by(__.values("order").fold())
+        .toList()
+    )
+    city_list = []
+    for c in cities:
+        city_data = map_to_dict(c["city"])
+        city_data["day"] = (c.get("day") or [None])[0]
+        city_data["order"] = (c.get("order") or [None])[0]
+        city_list.append(city_data)
+
+    attractions = (
+        g.V().hasLabel("Package").has("code", package_code)
+        .outE("INCLUDES")
+        .project("attraction", "day", "order", "layer")
+        .by(__.inV().valueMap(True))
+        .by(__.values("day").fold())
+        .by(__.values("order").fold())
+        .by(__.values("layer").fold())
+        .toList()
+    )
+    attraction_list = []
+    for a in attractions:
+        attr_data = map_to_dict(a["attraction"])
+        attr_data["day"] = (a.get("day") or [None])[0]
+        attr_data["order"] = (a.get("order") or [None])[0]
+        attr_data["layer"] = (a.get("layer") or [None])[0]
+        attraction_list.append(attr_data)
+
+    hotels = (
+        g.V().hasLabel("Package").has("code", package_code)
+        .out("INCLUDES_HOTEL").valueMap(True).toList()
+    )
+    hotel_list = [map_to_dict(h) for h in hotels]
+
+    routes = (
+        g.V().hasLabel("Package").has("code", package_code)
+        .outE("DEPARTS_ON")
+        .project("route", "type")
+        .by(__.inV().valueMap(True))
+        .by(__.values("type").fold())
+        .toList()
+    )
+    route_list = []
+    for r in routes:
+        route_data = map_to_dict(r["route"])
+        route_data["flight_type"] = (r.get("type") or [None])[0]
+        route_list.append(route_data)
+
+    themes = (
+        g.V().hasLabel("Package").has("code", package_code)
+        .out("TAGGED").valueMap(True).toList()
+    )
+    theme_list = [map_to_dict(t) for t in themes]
+
+    activities = (
+        g.V().hasLabel("Package").has("code", package_code)
+        .outE("HAS_ACTIVITY")
+        .project("activity", "day")
+        .by(__.inV().valueMap(True))
+        .by(__.values("day").fold())
+        .toList()
+    )
+    activity_list = []
+    for act in activities:
+        act_data = map_to_dict(act["activity"])
+        act_data["day"] = (act.get("day") or [None])[0]
+        activity_list.append(act_data)
+
+    result = {
+        "package": package,
+        "cities": city_list,
+        "attractions": attraction_list,
+        "hotels": hotel_list,
+        "routes": route_list,
+        "themes": theme_list,
+        "activities": activity_list,
+    }
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 2. search_packages
+# -------------------------------------------------------------------------
+def search_packages(
+    destination: str,
+    theme: str = "",
+    season: str = "",
+    nights: int = 0,
+    max_budget: int = 0,
+    shopping_max: int = -1,
+) -> str:
+    """Search for existing travel packages matching conditions."""
+    g = get_connection()
+
+    t = (
+        g.V().hasLabel("Package")
+        .where(
+            __.out("VISITS").hasLabel("City")
+            .or_(__.has("name", destination), __.has("region", destination))
+        )
+    )
+
+    if theme:
+        t = t.where(__.out("TAGGED").has("name", theme))
+    if season:
+        t = t.has("season", TextP.containing(season))
+    if nights and nights > 0:
+        t = t.has("nights", nights)
+    if max_budget and max_budget > 0:
+        t = t.has("price", P.lte(max_budget))
+    if shopping_max >= 0:
+        t = t.has("shopping_count", P.lte(shopping_max))
+
+    results = t.order().by("rating", Order.desc).limit(10).valueMap(True).toList()
+
+    packages = []
+    for r in results:
+        pkg = map_to_dict(r)
+        for field in ("season", "hashtags", "guide_fee"):
+            if field in pkg:
+                pkg[field] = parse_json_field(pkg[field])
+        packages.append(pkg)
+
+    return json.dumps({"packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 3. get_routes_by_region
+# -------------------------------------------------------------------------
+def get_routes_by_region(region: str) -> str:
+    """Retrieve available flight routes for a region."""
+    g = get_connection()
+
+    results = (
+        g.V().hasLabel("Route")
+        .where(__.out("TO").hasLabel("City").has("region", region))
+        .valueMap(True).toList()
+    )
+    routes = [map_to_dict(r) for r in results]
+    return json.dumps({"routes": routes, "count": len(routes)}, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 4. get_attractions_by_city
+# -------------------------------------------------------------------------
+def get_attractions_by_city(city: str, category: str = "") -> str:
+    """Retrieve attractions in a city, optionally filtered by category."""
+    g = get_connection()
+
+    t = (
+        g.V().hasLabel("City").has("name", city)
+        .out("HAS_ATTRACTION").hasLabel("Attraction")
+    )
+    if category:
+        t = t.has("category", category)
+
+    results = t.valueMap(True).toList()
+    attractions = [map_to_dict(a) for a in results]
+    return json.dumps({"attractions": attractions, "count": len(attractions)}, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 5. get_hotels_by_city
+# -------------------------------------------------------------------------
+def get_hotels_by_city(city: str, grade: str = "", has_onsen: bool = False) -> str:
+    """Retrieve hotels in a city, optionally filtered by grade and onsen."""
+    g = get_connection()
+
+    t = (
+        g.V().hasLabel("City").has("name", city)
+        .out("HAS_HOTEL").hasLabel("Hotel")
+    )
+    if grade:
+        t = t.has("grade", grade)
+    if has_onsen:
+        t = t.has("has_onsen", True)
+
+    results = t.valueMap(True).toList()
+    hotels = [map_to_dict(h) for h in results]
+    return json.dumps({"hotels": hotels, "count": len(hotels)}, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 6. get_trends
+# -------------------------------------------------------------------------
+def _compute_effective_score(virality_score: int, decay_rate: float, date_str: str) -> float:
+    """Compute effective_score = virality_score * (1 - decay_rate) ^ months_elapsed."""
+    try:
+        trend_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return float(virality_score)
+
+    now = datetime.now(timezone.utc)
+    months_elapsed = max(0, (now.year - trend_date.year) * 12 + (now.month - trend_date.month))
+    return virality_score * ((1 - decay_rate) ** months_elapsed)
+
+
+def get_trends(region: str, min_score: int = 30) -> str:
+    """Retrieve active trends and TrendSpot locations for a region."""
+    g = get_connection()
+
+    raw = (
+        g.V().hasLabel("Trend")
+        .has("virality_score", P.gte(min_score))
+        .where(
+            __.out("FILMED_AT", "FEATURES")
+            .out("LOCATED_IN").hasLabel("City").has("region", region)
+        )
+        .project("trend", "spots")
+        .by(__.valueMap(True))
+        .by(
+            __.out("FILMED_AT", "FEATURES")
+            .where(__.out("LOCATED_IN").hasLabel("City").has("region", region))
+            .valueMap(True).fold()
+        )
+        .toList()
+    )
+
+    trends = []
+    for item in raw:
+        trend_data = map_to_dict(item["trend"])
+        for field in ("keywords",):
+            if field in trend_data:
+                trend_data[field] = parse_json_field(trend_data[field])
+
+        virality = trend_data.get("virality_score", 0)
+        decay = trend_data.get("decay_rate", 0.1)
+        date_str = str(trend_data.get("date", ""))
+
+        effective = _compute_effective_score(
+            int(virality) if virality else 0,
+            float(decay) if decay else 0.1,
+            date_str,
+        )
+        if effective < min_score:
+            continue
+
+        spots = [map_to_dict(s) for s in item.get("spots", [])]
+        trends.append({
+            "trend": trend_data,
+            "effective_score": round(effective, 1),
+            "spots": spots,
+        })
+
+    trends.sort(key=lambda t: t["effective_score"], reverse=True)
+    trends = trends[:10]
+
+    return json.dumps({"trends": trends, "count": len(trends)}, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 7. get_similar_packages
+# -------------------------------------------------------------------------
+def get_similar_packages(package_code: str) -> str:
+    """Find packages similar to the given package via SIMILAR_TO edges."""
+    g = get_connection()
+
+    results = (
+        g.V().hasLabel("Package").has("code", package_code)
+        .outE("SIMILAR_TO")
+        .project("package", "score")
+        .by(__.inV().valueMap(True))
+        .by(__.values("score"))
+        .order().by(__.select("score"), Order.desc)
+        .limit(10).toList()
+    )
+
+    packages = []
+    for r in results:
+        pkg = map_to_dict(r["package"])
+        for field in ("season", "hashtags", "guide_fee"):
+            if field in pkg:
+                pkg[field] = parse_json_field(pkg[field])
+        packages.append({
+            "package": pkg,
+            "similarity_score": r.get("score", 0),
+        })
+
+    return json.dumps({"similar_packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 8. get_nearby_cities
+# -------------------------------------------------------------------------
+def get_nearby_cities(city: str, max_km: int = 100) -> str:
+    """Find cities near the specified city within a maximum distance."""
+    g = get_connection()
+
+    results = (
+        g.V().hasLabel("City").has("name", city)
+        .outE("NEAR").has("distance_km", P.lte(max_km))
+        .project("city", "distance_km")
+        .by(__.inV().valueMap(True))
+        .by(__.values("distance_km"))
+        .order().by(__.select("distance_km"), Order.asc)
+        .toList()
+    )
+
+    cities = []
+    for r in results:
+        city_data = map_to_dict(r["city"])
+        city_data["distance_km"] = r.get("distance_km", 0)
+        cities.append(city_data)
+
+    return json.dumps({"nearby_cities": cities, "count": len(cities)}, ensure_ascii=False, default=str)

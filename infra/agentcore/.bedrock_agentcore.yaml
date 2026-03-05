@@ -1,0 +1,16 @@
+runtime: PYTHON_3_11
+agent_entry:
+  module: src.main
+  method: handler
+networking:
+  mode: VPC
+  subnet_ids:
+    - subnet-xxx
+  security_group_ids:
+    - sg-xxx
+environment:
+  NEPTUNE_ENDPOINT: "wss://REDACTED_NEPTUNE_HOST:8182/gremlin"
+  REDIS_HOST: "REDACTED_VALKEY_HOST"
+  REDIS_PORT: "6379"
+  BEDROCK_REGION: "us-east-1"
+  AWS_REGION: "ap-northeast-2"
