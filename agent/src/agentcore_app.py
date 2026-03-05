@@ -259,8 +259,15 @@ async def _handle_planning(payload):
         if planning_output_data and isinstance(planning_output_data, dict) and len(planning_output_data) > 0:
             output = PlanningOutput(**planning_output_data)
         else:
-            gen_result = result.results.get("generate_itinerary")
-            validate_result = result.results.get("validate")
+            # Try new 2-phase node names first, then legacy
+            gen_result = (
+                result.results.get("generate_day_details")
+                or result.results.get("generate_itinerary")
+            )
+            validate_result = (
+                result.results.get("validate_day_details")
+                or result.results.get("validate")
+            )
             target = gen_result or validate_result
             if target and target.result:
                 output_text = str(target.result)

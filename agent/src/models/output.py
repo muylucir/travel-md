@@ -189,3 +189,131 @@ class PlanningOutput(BaseModel):
     trend_sources: List[str] = Field(default_factory=list, description="Trend sources referenced")
     generated_at: str = Field(default="", description="Server-generated on save. Do NOT generate this field.")
     generated_by: str = Field(default="ai-agent", description="Server-generated on save. Do NOT generate this field.")
+
+
+# ─── Phase 1: Skeleton Output ───
+
+class SkeletonDayAllocation(BaseModel):
+    """Single day in the skeleton: city assignment only, no attraction details."""
+
+    day: int = Field(..., description="Day number starting from 1")
+    date: str = Field(default="", description="e.g. 04/01")
+    day_of_week: str = Field(default="", description="e.g. 수")
+    cities: str = Field(default="", description="Comma-separated cities for this day")
+
+
+class SkeletonOutput(BaseModel):
+    """Phase 1 output: travel structure without per-day attraction details."""
+
+    package_name: str = Field(..., description="Package product name")
+    description: str = Field(default="", description="One-paragraph summary")
+    nights: int = Field(..., description="Number of nights")
+    days: int = Field(..., description="Number of days")
+    duration: str = Field(default="", description="e.g. '3박 4일'")
+
+    airline: str = Field(default="", description="Airline name")
+    airline_type: str = Field(default="", description="FSC/LCC")
+    departure_flight: FlightDetail = Field(default_factory=FlightDetail)
+    return_flight: FlightDetail = Field(default_factory=FlightDetail)
+
+    travel_cities: str = Field(default="", description="e.g. '오사카(2)-교토'")
+    city_list: List[str] = Field(default_factory=list, description="City names")
+    hotels: List[str] = Field(default_factory=list, description="Hotel names per night")
+    day_allocations: List[SkeletonDayAllocation] = Field(default_factory=list, description="City assignment per day")
+
+    pricing: Pricing = Field(default_factory=Pricing)
+    shopping_count: int = Field(default=0)
+    guide_fee: GuideFee = Field(default_factory=GuideFee)
+
+    country: str = Field(default="")
+    region: str = Field(default="")
+    similarity_score: int = Field(default=50)
+    reference_products: List[str] = Field(default_factory=list)
+
+    inclusions: List[CostItem] = Field(default_factory=list)
+    exclusions: List[CostItem] = Field(default_factory=list)
+    optional_costs: List[CostItem] = Field(default_factory=list)
+    insurance: Insurance = Field(default_factory=Insurance)
+    meeting_info: MeetingInfo = Field(default_factory=MeetingInfo)
+    booking_policy: BookingPolicy = Field(default_factory=BookingPolicy)
+    destination_cities: List[DestinationCity] = Field(default_factory=list)
+
+    changes_summary: ChangesSummary = Field(default_factory=ChangesSummary)
+
+
+# ─── Phase 2: Day Detail Output ───
+
+class DayDetailOutput(BaseModel):
+    """Phase 2 output: detailed itinerary for a single day."""
+
+    day: int = Field(..., description="Day number")
+    date: str = Field(default="", description="e.g. 04/01")
+    day_of_week: str = Field(default="", description="e.g. 수")
+    cities: str = Field(default="", description="Cities visited this day")
+    attractions: List[str] = Field(default_factory=list, description="Attraction names in visit order")
+    attraction_details: List[Attraction] = Field(default_factory=list, description="Name + description for each attraction")
+    highlights: List[str] = Field(default_factory=list, description="Day-specific highlights (1-2 lines)")
+
+
+# ─── Merge Function ───
+
+def merge_skeleton_and_days(
+    skeleton: SkeletonOutput,
+    day_details: List[DayDetailOutput],
+) -> PlanningOutput:
+    """Assemble a complete PlanningOutput from skeleton + day details."""
+    itinerary: List[DayItinerary] = []
+    all_attractions: List[Attraction] = []
+    all_highlights: List[str] = []
+
+    for detail in sorted(day_details, key=lambda d: d.day):
+        itinerary.append(DayItinerary(
+            day=detail.day,
+            date=detail.date,
+            day_of_week=detail.day_of_week,
+            cities=detail.cities,
+            attractions=detail.attractions,
+        ))
+        all_attractions.extend(detail.attraction_details)
+        all_highlights.extend(detail.highlights)
+
+    # Deduplicate attractions by name
+    seen: set[str] = set()
+    unique_attractions: List[Attraction] = []
+    for attr in all_attractions:
+        if attr.name not in seen:
+            seen.add(attr.name)
+            unique_attractions.append(attr)
+
+    return PlanningOutput(
+        package_name=skeleton.package_name,
+        description=skeleton.description,
+        nights=skeleton.nights,
+        days=skeleton.days,
+        duration=skeleton.duration,
+        airline=skeleton.airline,
+        airline_type=skeleton.airline_type,
+        departure_flight=skeleton.departure_flight,
+        return_flight=skeleton.return_flight,
+        travel_cities=skeleton.travel_cities,
+        city_list=skeleton.city_list,
+        pricing=skeleton.pricing,
+        shopping_count=skeleton.shopping_count,
+        guide_fee=skeleton.guide_fee,
+        hotels=skeleton.hotels,
+        itinerary=itinerary,
+        attractions=unique_attractions,
+        highlights=all_highlights[:10],
+        inclusions=skeleton.inclusions,
+        exclusions=skeleton.exclusions,
+        optional_costs=skeleton.optional_costs,
+        insurance=skeleton.insurance,
+        meeting_info=skeleton.meeting_info,
+        booking_policy=skeleton.booking_policy,
+        destination_cities=skeleton.destination_cities,
+        country=skeleton.country,
+        region=skeleton.region,
+        similarity_score=skeleton.similarity_score,
+        reference_products=skeleton.reference_products,
+        changes_summary=skeleton.changes_summary,
+    )

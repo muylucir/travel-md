@@ -11,7 +11,6 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
 
 from strands.agent.agent_result import AgentResult
 from strands.multiagent.base import MultiAgentBase, MultiAgentResult, NodeResult, Status
@@ -19,10 +18,18 @@ from strands.types.content import ContentBlock, Message
 
 from src.agents.chat_parser import create_chat_parser_agent
 from src.agents.itinerary import create_itinerary_agent
+from src.agents.skeleton import create_skeleton_agent
+from src.agents.day_detail import create_day_detail_agent
 from src.models.input import PlanningInput
-from src.models.output import PlanningOutput
+from src.models.output import (
+    PlanningOutput,
+    SkeletonOutput,
+    DayDetailOutput,
+    merge_skeleton_and_days,
+)
 from src.similarity.layer_rules import format_rules_for_prompt, compute_change_rules
-from src.validator.itinerary_validator import validate_itinerary
+from src.validator.itinerary_validator import validate_itinerary, validate_skeleton
+from src.cache import get_cache
 from src.mcp_connection import get_mcp_client, prefixed
 
 logger = logging.getLogger(__name__)
@@ -149,9 +156,17 @@ class CollectContextNode(MultiAgentBase):
         context_parts: dict = {}
         _call_id = 0
 
+        cache = get_cache()
+
         def _safe_call(key: str, tool_name: str, arguments: dict):
             nonlocal _call_id
             _call_id += 1
+
+            cached = cache.get(tool_name, arguments)
+            if cached is not None:
+                context_parts[key] = cached
+                return
+
             try:
                 result = mcp.call_tool_sync(
                     tool_use_id=f"ctx-{_call_id}",
@@ -159,6 +174,7 @@ class CollectContextNode(MultiAgentBase):
                     arguments=arguments,
                 )
                 context_parts[key] = result
+                cache.set(tool_name, arguments, result)
             except Exception as e:
                 logger.warning("MCP call failed %s/%s: %s", key, tool_name, e)
 
@@ -391,4 +407,266 @@ class ValidateNode(MultiAgentBase):
         return MultiAgentResult(
             status=Status.COMPLETED,
             results={"validate": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Node 5: Generate Skeleton (Phase 1 — Sonnet, fast)
+# ---------------------------------------------------------------------------
+class GenerateSkeletonNode(MultiAgentBase):
+    """Phase 1: Generate travel structure (cities, flights, hotels, pricing)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._agent = None
+
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        start = time.time()
+        invocation_state = invocation_state or {}
+
+        if self._agent is None:
+            self._agent = create_skeleton_agent()
+
+        planning_input = invocation_state.get("planning_input_parsed", {})
+        graph_context = invocation_state.get("graph_context", {})
+        rules_prompt = invocation_state.get("similarity_rules_prompt", "")
+        correction_guide = invocation_state.get("skeleton_correction_guide", "")
+        retry_count = invocation_state.get("skeleton_retry_count", 0)
+
+        parts = [
+            "## 기획 요청",
+            json.dumps(planning_input, ensure_ascii=False, default=str),
+            "",
+            rules_prompt,
+            "",
+            "## Graph 컨텍스트",
+            json.dumps(graph_context, ensure_ascii=False, default=str),
+        ]
+
+        if correction_guide:
+            parts.extend([
+                "",
+                f"## 이전 골격 검증 실패 (재시도 {retry_count}/3)",
+                correction_guide,
+                "",
+                "위 문제를 수정하여 다시 골격을 생성하세요.",
+            ])
+
+        result = self._agent("\n".join(parts))
+        skeleton: SkeletonOutput = result.structured_output
+
+        invocation_state["skeleton_output"] = skeleton.model_dump()
+        invocation_state["skeleton_output_obj"] = skeleton
+
+        output_text = json.dumps(skeleton.model_dump(), ensure_ascii=False, default=str)
+        elapsed = time.time() - start
+        logger.info("GenerateSkeletonNode completed in %.2fs", elapsed)
+
+        agent_result = _make_agent_result(output_text)
+        return MultiAgentResult(
+            status=Status.COMPLETED,
+            results={"generate_skeleton": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Node 6: Validate Skeleton
+# ---------------------------------------------------------------------------
+class ValidateSkeletonNode(MultiAgentBase):
+    """Validate skeleton structure: day count, route logic, flight buffer."""
+
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        start = time.time()
+        invocation_state = invocation_state or {}
+
+        skeleton_data = invocation_state.get("skeleton_output")
+        if skeleton_data and isinstance(skeleton_data, dict):
+            skeleton = SkeletonOutput(**skeleton_data)
+        else:
+            skeleton = invocation_state.get("skeleton_output_obj")
+        if skeleton is None:
+            raise RuntimeError("ValidateSkeletonNode: no skeleton found")
+
+        validation = validate_skeleton(skeleton)
+        retry_count = invocation_state.get("skeleton_retry_count", 0)
+
+        if validation.passed:
+            invocation_state["skeleton_validation_passed"] = True
+            invocation_state["skeleton_needs_retry"] = False
+            status_msg = f"SKELETON_PASS (score={validation.score})"
+        elif retry_count < 3:
+            invocation_state["skeleton_validation_passed"] = False
+            invocation_state["skeleton_needs_retry"] = True
+            invocation_state["skeleton_retry_count"] = retry_count + 1
+            invocation_state["skeleton_correction_guide"] = validation.correction_guide
+            status_msg = f"SKELETON_FAIL (score={validation.score}, retry {retry_count + 1}/3)"
+        else:
+            invocation_state["skeleton_validation_passed"] = True
+            invocation_state["skeleton_needs_retry"] = False
+            status_msg = f"SKELETON_PASS_WITH_WARNINGS (score={validation.score})"
+
+        elapsed = time.time() - start
+        logger.info("ValidateSkeletonNode completed in %.2fs -- %s", elapsed, status_msg)
+
+        output_text = json.dumps({"status": status_msg}, ensure_ascii=False)
+        agent_result = _make_agent_result(output_text)
+        return MultiAgentResult(
+            status=Status.COMPLETED,
+            results={"validate_skeleton": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Node 7: Generate Day Details (Phase 2 — Opus, sequential per day)
+# ---------------------------------------------------------------------------
+class GenerateDayDetailsNode(MultiAgentBase):
+    """Phase 2: Fill in per-day attractions, meals, activities."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._agent = None
+
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        start = time.time()
+        invocation_state = invocation_state or {}
+
+        if self._agent is None:
+            self._agent = create_day_detail_agent()
+
+        skeleton_data = invocation_state.get("skeleton_output")
+        skeleton = SkeletonOutput(**skeleton_data) if skeleton_data else invocation_state.get("skeleton_output_obj")
+        graph_context = invocation_state.get("graph_context", {})
+        rules_prompt = invocation_state.get("similarity_rules_prompt", "")
+        failed_days = invocation_state.get("failed_days", [])
+
+        # Existing day details from previous iteration (for partial retry)
+        existing_details = invocation_state.get("day_details_list", [])
+        existing_by_day = {d["day"]: d for d in existing_details}
+
+        day_details: list = []
+        visited_attractions: list[str] = []
+
+        for day_alloc in sorted(skeleton.day_allocations, key=lambda d: d.day):
+            # Skip days that already passed validation (partial retry)
+            if failed_days and day_alloc.day not in failed_days and day_alloc.day in existing_by_day:
+                existing = DayDetailOutput(**existing_by_day[day_alloc.day])
+                day_details.append(existing)
+                visited_attractions.extend(existing.attractions)
+                continue
+
+            # Build per-day prompt
+            parts = [
+                f"## {day_alloc.day}일차 상세 기획",
+                f"- 날짜: {day_alloc.date} ({day_alloc.day_of_week})",
+                f"- 도시: {day_alloc.cities}",
+                f"- 숙소: {skeleton.hotels[day_alloc.day - 1] if day_alloc.day <= len(skeleton.hotels) else '(귀국일)'}",
+                f"- 항공편: 출발 {skeleton.departure_flight.arrival_time} / 귀국 {skeleton.return_flight.departure_time}",
+                f"- 전체 일정: {skeleton.days}일 중 {day_alloc.day}일차",
+                "",
+                rules_prompt,
+                "",
+                "## 이전 날짜 방문 관광지 (중복 금지)",
+                ", ".join(visited_attractions) if visited_attractions else "(없음)",
+                "",
+                "## Graph 컨텍스트",
+                json.dumps(graph_context, ensure_ascii=False, default=str),
+            ]
+
+            correction = invocation_state.get(f"day_{day_alloc.day}_correction", "")
+            if correction:
+                parts.extend(["", "## 이전 검증 실패", correction, "위 문제를 수정하세요."])
+
+            result = self._agent("\n".join(parts))
+            day_detail: DayDetailOutput = result.structured_output
+
+            # Ensure day metadata matches skeleton
+            day_detail.day = day_alloc.day
+            day_detail.date = day_alloc.date
+            day_detail.day_of_week = day_alloc.day_of_week
+            day_detail.cities = day_alloc.cities
+
+            day_details.append(day_detail)
+            visited_attractions.extend(day_detail.attractions)
+
+        # Merge into PlanningOutput
+        final_output = merge_skeleton_and_days(skeleton, day_details)
+
+        invocation_state["planning_output"] = final_output.model_dump()
+        invocation_state["planning_output_obj"] = final_output
+        invocation_state["day_details_list"] = [d.model_dump() for d in day_details]
+
+        output_text = json.dumps({"days_generated": len(day_details)}, ensure_ascii=False)
+        elapsed = time.time() - start
+        logger.info("GenerateDayDetailsNode completed in %.2fs (%d days)", elapsed, len(day_details))
+
+        agent_result = _make_agent_result(output_text)
+        return MultiAgentResult(
+            status=Status.COMPLETED,
+            results={"generate_day_details": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Node 8: Validate Day Details (per-day + cross-day)
+# ---------------------------------------------------------------------------
+class ValidateDayDetailsNode(MultiAgentBase):
+    """Validate merged PlanningOutput: per-day + cross-day checks."""
+
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        start = time.time()
+        invocation_state = invocation_state or {}
+
+        output_obj = invocation_state.get("planning_output_obj")
+        if output_obj is None:
+            output_data = invocation_state.get("planning_output")
+            if output_data:
+                output_obj = PlanningOutput(**output_data)
+            else:
+                raise RuntimeError("ValidateDayDetailsNode: no PlanningOutput found")
+
+        validation = validate_itinerary(output_obj)
+        retry_count = invocation_state.get("day_retry_count", 0)
+
+        if validation.passed:
+            invocation_state["validation_passed"] = True
+            invocation_state["days_need_retry"] = False
+            invocation_state["validation_result"] = validation.model_dump()
+            invocation_state["failed_days"] = []
+            status_msg = f"DAYS_PASS (score={validation.score})"
+        elif retry_count < 3:
+            invocation_state["validation_passed"] = False
+            invocation_state["days_need_retry"] = True
+            invocation_state["day_retry_count"] = retry_count + 1
+            invocation_state["validation_result"] = validation.model_dump()
+
+            # Identify which days failed
+            failed = set()
+            for issue in validation.issues:
+                if hasattr(issue, "day") and issue.day:
+                    failed.add(issue.day)
+            invocation_state["failed_days"] = list(failed) if failed else list(range(1, output_obj.days + 1))
+
+            # Store per-day correction guides
+            for day_num in invocation_state["failed_days"]:
+                day_issues = [i for i in validation.issues if getattr(i, "day", None) == day_num]
+                if day_issues:
+                    guide = "\n".join(f"- {i.message}" for i in day_issues)
+                    invocation_state[f"day_{day_num}_correction"] = guide
+
+            status_msg = f"DAYS_FAIL (score={validation.score}, retry {retry_count + 1}/3, failed_days={invocation_state['failed_days']})"
+        else:
+            invocation_state["validation_passed"] = True
+            invocation_state["days_need_retry"] = False
+            invocation_state["validation_result"] = validation.model_dump()
+            invocation_state["failed_days"] = []
+            status_msg = f"DAYS_PASS_WITH_WARNINGS (score={validation.score})"
+
+        elapsed = time.time() - start
+        logger.info("ValidateDayDetailsNode completed in %.2fs -- %s", elapsed, status_msg)
+
+        output_text = json.dumps({"status": status_msg, "validation": validation.model_dump()}, ensure_ascii=False, default=str)
+        agent_result = _make_agent_result(output_text)
+        return MultiAgentResult(
+            status=Status.COMPLETED,
+            results={"validate_day_details": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
         )

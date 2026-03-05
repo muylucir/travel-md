@@ -4,3 +4,4 @@ bedrock-agentcore>=0.1.0
 mcp>=1.0.0
 httpx>=0.27.0
 pydantic>=2.7.0
+redis>=5.0.0

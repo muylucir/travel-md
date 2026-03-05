@@ -75,6 +75,11 @@ def validate_itinerary(output: PlanningOutput) -> ValidationResult:
     # Basic structure checks
     issues.extend(_validate_structure(output))
 
+    # Cross-day checks
+    issues.extend(_validate_city_transitions(output))
+    issues.extend(_validate_hotel_next_day_proximity(output))
+    issues.extend(_validate_itinerary_continuity(output))
+
     # Score calculation
     error_count = sum(1 for i in issues if i.severity == Severity.ERROR)
     warning_count = sum(1 for i in issues if i.severity == Severity.WARNING)
@@ -300,6 +305,180 @@ def _validate_structure(output: PlanningOutput) -> list[Issue]:
     return issues
 
 
+def _validate_city_transitions(output: PlanningOutput) -> list[Issue]:
+    """Check consecutive days for unreasonable city jumps."""
+    issues: list[Issue] = []
+
+    DISTANT_CITY_PAIRS = {
+        # Japan
+        frozenset({"도쿄", "오사카"}),
+        frozenset({"도쿄", "후쿠오카"}),
+        frozenset({"삿포로", "오사카"}),
+        frozenset({"삿포로", "도쿄"}),
+        # SE Asia
+        frozenset({"방콕", "치앙마이"}),
+        frozenset({"하노이", "호치민"}),
+        # Europe
+        frozenset({"파리", "로마"}),
+        frozenset({"런던", "바르셀로나"}),
+    }
+
+    itinerary = output.itinerary
+    for i in range(len(itinerary) - 1):
+        day_a = itinerary[i]
+        day_b = itinerary[i + 1]
+
+        cities_a = {c.strip() for c in day_a.cities.split(",") if c.strip()} if day_a.cities else set()
+        cities_b = {c.strip() for c in day_b.cities.split(",") if c.strip()} if day_b.cities else set()
+
+        # Check for known distant city pairs
+        for ca in cities_a:
+            for cb in cities_b:
+                if frozenset({ca, cb}) in DISTANT_CITY_PAIRS:
+                    issues.append(Issue(
+                        severity=Severity.WARNING,
+                        day=day_a.day,
+                        message=(
+                            f"{day_a.day}일차→{day_b.day}일차: "
+                            f"{ca}에서 {cb}(으)로의 장거리 이동이 감지되었습니다. "
+                            f"이동에 상당한 시간이 소요될 수 있습니다."
+                        ),
+                        suggestion=(
+                            f"{day_a.day}일차와 {day_b.day}일차 사이에 "
+                            f"이동일을 배치하거나 인접 도시로 일정을 재구성하세요."
+                        ),
+                    ))
+
+        # Check for too many new cities
+        new_cities = cities_b - cities_a
+        if len(new_cities) > 2:
+            issues.append(Issue(
+                severity=Severity.WARNING,
+                day=day_b.day,
+                message=(
+                    f"{day_b.day}일차: 전날 대비 {len(new_cities)}개의 "
+                    f"새로운 도시({', '.join(sorted(new_cities))})가 등장합니다. "
+                    f"이동 부담이 클 수 있습니다."
+                ),
+                suggestion=(
+                    f"{day_b.day}일차의 새로운 도시를 2개 이하로 줄이고 "
+                    f"나머지는 다른 날로 분산하세요."
+                ),
+            ))
+
+    return issues
+
+
+def _validate_hotel_next_day_proximity(output: PlanningOutput) -> list[Issue]:
+    """Check if the last city of day i differs from the first city of day i+1."""
+    issues: list[Issue] = []
+
+    itinerary = output.itinerary
+    for i in range(len(itinerary) - 1):
+        day_a = itinerary[i]
+        day_b = itinerary[i + 1]
+
+        cities_a = [c.strip() for c in day_a.cities.split(",") if c.strip()] if day_a.cities else []
+        cities_b = [c.strip() for c in day_b.cities.split(",") if c.strip()] if day_b.cities else []
+
+        if not cities_a or not cities_b:
+            continue
+
+        last_city_today = cities_a[-1]
+        first_city_tomorrow = cities_b[0]
+
+        if last_city_today != first_city_tomorrow:
+            issues.append(Issue(
+                severity=Severity.WARNING,
+                day=day_a.day,
+                message=(
+                    f"{day_a.day}일차 마지막 도시({last_city_today})와 "
+                    f"{day_b.day}일차 첫 도시({first_city_tomorrow})가 다릅니다. "
+                    f"숙소 위치 또는 아침 이동 시간을 고려해야 합니다."
+                ),
+                suggestion=(
+                    f"{day_a.day}일차 숙소를 {first_city_tomorrow} 근처에 배치하거나, "
+                    f"{day_b.day}일차 오전에 이동 시간을 확보하세요."
+                ),
+            ))
+
+    return issues
+
+
+def _validate_itinerary_continuity(output: PlanningOutput) -> list[Issue]:
+    """Check duplicate attractions, missing attraction definitions, and unbalanced days."""
+    issues: list[Issue] = []
+
+    # Collect all attraction names across days
+    all_day_attractions: list[tuple[int, str]] = []
+    attractions_by_day: dict[int, list[str]] = {}
+    seen_attractions: dict[str, int] = {}  # name -> first day seen
+
+    for day_plan in output.itinerary:
+        attractions_by_day[day_plan.day] = day_plan.attractions
+        for attr_name in day_plan.attractions:
+            all_day_attractions.append((day_plan.day, attr_name))
+
+            # Check for duplicates across days
+            if attr_name in seen_attractions:
+                issues.append(Issue(
+                    severity=Severity.ERROR,
+                    day=day_plan.day,
+                    message=(
+                        f"'{attr_name}'이(가) {seen_attractions[attr_name]}일차와 "
+                        f"{day_plan.day}일차에 중복 배치되었습니다."
+                    ),
+                    suggestion=(
+                        f"'{attr_name}'을(를) 한 날에만 배치하고 "
+                        f"다른 날에는 대체 관광지를 추가하세요."
+                    ),
+                ))
+            else:
+                seen_attractions[attr_name] = day_plan.day
+
+    # Check that all itinerary attractions exist in output.attractions list
+    defined_attraction_names = {a.name for a in output.attractions}
+    for day_num, attr_name in all_day_attractions:
+        if attr_name not in defined_attraction_names:
+            issues.append(Issue(
+                severity=Severity.WARNING,
+                day=day_num,
+                message=(
+                    f"'{attr_name}'이(가) 일정에 포함되어 있지만 "
+                    f"관광지 목록(attractions)에 정의되지 않았습니다."
+                ),
+                suggestion=f"'{attr_name}'의 설명을 attractions 목록에 추가하세요.",
+            ))
+
+    # Check for unbalanced days
+    sorted_days = sorted(attractions_by_day.keys())
+    for idx in range(1, len(sorted_days) - 1):
+        prev_day = sorted_days[idx - 1]
+        curr_day = sorted_days[idx]
+        next_day = sorted_days[idx + 1]
+
+        prev_count = len(attractions_by_day[prev_day])
+        curr_count = len(attractions_by_day[curr_day])
+        next_count = len(attractions_by_day[next_day])
+
+        if prev_count >= 4 and next_count >= 4 and curr_count <= 1:
+            issues.append(Issue(
+                severity=Severity.WARNING,
+                day=curr_day,
+                message=(
+                    f"{curr_day}일차의 관광지가 {curr_count}개로, "
+                    f"전날({prev_count}개)·다음날({next_count}개) 대비 "
+                    f"지나치게 적습니다. 일정 균형이 맞지 않습니다."
+                ),
+                suggestion=(
+                    f"인접 일차의 관광지를 {curr_day}일차로 "
+                    f"일부 이동하여 균형을 맞추세요."
+                ),
+            ))
+
+    return issues
+
+
 def _build_correction_guide(issues: list[Issue]) -> str:
     """Build a correction guide string for the LLM retry prompt."""
     lines = ["## 일정 검증 실패 -- 다음 문제를 수정하세요:", ""]
@@ -323,3 +502,79 @@ def _build_correction_guide(issues: list[Issue]) -> str:
                 lines.append(f"     -> 수정 방법: {warn.suggestion}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Skeleton Validation (Phase 1)
+# ---------------------------------------------------------------------------
+
+def validate_skeleton(skeleton) -> ValidationResult:
+    """Validate skeleton structure: day count, flights, city transitions, hotels."""
+    issues: list[Issue] = []
+
+    # Day count matches
+    if len(skeleton.day_allocations) != skeleton.days:
+        issues.append(Issue(
+            severity=Severity.ERROR,
+            day=0,
+            message=f"day_allocations({len(skeleton.day_allocations)})와 days({skeleton.days})가 불일치합니다.",
+            suggestion="day_allocations 수를 days와 맞추세요.",
+        ))
+
+    # Hotel count matches nights
+    if len(skeleton.hotels) < skeleton.nights:
+        issues.append(Issue(
+            severity=Severity.WARNING,
+            day=0,
+            message=f"호텔({len(skeleton.hotels)}개)이 nights({skeleton.nights})보다 적습니다.",
+            suggestion=f"호텔을 {skeleton.nights}개로 설정하세요 (마지막 날 제외).",
+        ))
+
+    # City transitions between consecutive days
+    DISTANT_PAIRS = {
+        frozenset({"도쿄", "오사카"}), frozenset({"도쿄", "후쿠오카"}),
+        frozenset({"삿포로", "오사카"}), frozenset({"삿포로", "도쿄"}),
+        frozenset({"방콕", "치앙마이"}), frozenset({"하노이", "호치민"}),
+        frozenset({"파리", "로마"}), frozenset({"런던", "바르셀로나"}),
+    }
+
+    allocs = sorted(skeleton.day_allocations, key=lambda d: d.day)
+    for i in range(len(allocs) - 1):
+        curr_cities = {c.strip() for c in allocs[i].cities.split(",") if c.strip()}
+        next_cities = {c.strip() for c in allocs[i + 1].cities.split(",") if c.strip()}
+        for c1 in curr_cities:
+            for c2 in next_cities:
+                if c1 != c2 and frozenset({c1, c2}) in DISTANT_PAIRS:
+                    issues.append(Issue(
+                        severity=Severity.WARNING,
+                        day=allocs[i].day,
+                        message=f"{allocs[i].day}일차→{allocs[i+1].day}일차: {c1}→{c2} 장거리 이동",
+                        suggestion="중간 이동일을 배치하거나 인접 도시로 변경하세요.",
+                    ))
+
+    # Flight buffer checks (simplified)
+    if skeleton.departure_flight.arrival_time and len(allocs) > 0:
+        try:
+            arr_h, arr_m = map(int, skeleton.departure_flight.arrival_time.split(":"))
+            available_start = arr_h + 3
+            if available_start >= 22 and len(allocs[0].cities.split(",")) > 1:
+                issues.append(Issue(
+                    severity=Severity.WARNING, day=1,
+                    message="1일차: 도착 후 가용시간이 매우 짧습니다.",
+                    suggestion="1일차는 가벼운 일정으로 구성하세요.",
+                ))
+        except (ValueError, AttributeError):
+            pass
+
+    # Score
+    errors = [i for i in issues if i.severity == Severity.ERROR]
+    warnings = [i for i in issues if i.severity == Severity.WARNING]
+    score = max(0, 100 - len(errors) * 15 - len(warnings) * 5)
+    passed = score >= 70
+
+    return ValidationResult(
+        score=score,
+        passed=passed,
+        issues=issues,
+        correction_guide=_build_correction_guide(issues) if not passed else "",
+    )
