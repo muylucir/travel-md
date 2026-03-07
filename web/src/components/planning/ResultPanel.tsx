@@ -361,8 +361,14 @@ export default function ResultPanel({ result }: ResultPanelProps) {
           </div>
           <div>
             <Box variant="awsui-key-label">생성 일시</Box>
-            <Box variant="p">{result.generated_at || "-"}</Box>
+            <Box variant="p">{result.generated_at ? new Date(result.generated_at).toLocaleString("ko-KR") : "-"}</Box>
           </div>
+          {result.planning_elapsed_seconds != null && (
+            <div>
+              <Box variant="awsui-key-label">소요 시간</Box>
+              <Box variant="p">{result.planning_elapsed_seconds}초</Box>
+            </div>
+          )}
         </ColumnLayout>
       </Container>
     </SpaceBetween>

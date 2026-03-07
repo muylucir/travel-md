@@ -151,7 +151,9 @@ class CollectContextNode(MultiAgentBase):
         max_budget = planning_input.get("max_budget_per_person")
         shopping_max = planning_input.get("max_shopping_count")
         reference_id = planning_input.get("reference_product_id")
-        region = destination.split()[-1] if destination else destination
+        dest_parts = destination.split() if destination else []
+        region = dest_parts[-1] if dest_parts else destination
+        city_hint = dest_parts[-1] if dest_parts else destination
 
         context_parts: dict = {}
         _call_id = 0
@@ -194,6 +196,73 @@ class CollectContextNode(MultiAgentBase):
 
         if reference_id:
             _safe_call("similar_packages", "get_similar_packages", {"package_code": reference_id})
+
+        # --- Region resolution fallback ---
+        # If routes came back empty, region might be a city name (e.g., "오사카")
+        # Try to resolve the actual region via get_nearby_cities
+        routes_result = context_parts.get("routes")
+        routes_empty = not routes_result or (
+            isinstance(routes_result, str) and '"count": 0' in routes_result
+        )
+        if routes_empty and city_hint:
+            _safe_call("_city_info", "get_nearby_cities", {"city": city_hint, "max_km": 0})
+            city_info = context_parts.pop("_city_info", None)
+            if city_info:
+                # Parse region from nearby_cities response
+                info_str = str(city_info)
+                region_match = re.search(r'"region":\s*"([^"]+)"', info_str)
+                if region_match and region_match.group(1) != region:
+                    region = region_match.group(1)
+                    _safe_call("routes", "get_routes_by_region", {"region": region})
+                    _safe_call("trends", "get_trends", {"region": region, "min_score": 30})
+
+        # --- Per-city attraction and hotel pre-fetch ---
+        cities_to_query: set = set()
+
+        # Extract cities from search results
+        sr = context_parts.get("search_results")
+        if sr:
+            sr_str = str(sr)
+            for field in ("city_list", "travel_cities"):
+                for m in re.finditer(rf'"{field}":\s*\[([^\]]*)\]', sr_str):
+                    for city_m in re.finditer(r'"([^"]+)"', m.group(1)):
+                        cities_to_query.add(city_m.group(1))
+
+        # Extract cities from reference package
+        rp = context_parts.get("reference_package")
+        if rp:
+            rp_str = str(rp)
+            for m in re.finditer(r'"name":\s*"([^"]+)"', rp_str):
+                name = m.group(1)
+                if len(name) <= 8 and not any(c.isdigit() for c in name):
+                    cities_to_query.add(name)
+
+        if city_hint:
+            cities_to_query.add(city_hint)
+
+        # Remove departure cities
+        DEPARTURE = {"인천", "김포", "부산", "대구", "제주", "청주", "무안", "양양"}
+        cities_to_query -= DEPARTURE
+
+        # Fetch attractions and hotels for top 5 cities
+        city_attractions: dict = {}
+        city_hotels: dict = {}
+        for cname in list(cities_to_query)[:5]:
+            key_a = f"_attr_{cname}"
+            key_h = f"_hotel_{cname}"
+            _safe_call(key_a, "get_attractions_by_city", {"city": cname})
+            _safe_call(key_h, "get_hotels_by_city", {"city": cname})
+            result_a = context_parts.pop(key_a, None)
+            result_h = context_parts.pop(key_h, None)
+            if result_a:
+                city_attractions[cname] = result_a
+            if result_h:
+                city_hotels[cname] = result_h
+
+        if city_attractions:
+            context_parts["city_attractions"] = city_attractions
+        if city_hotels:
+            context_parts["city_hotels"] = city_hotels
 
         return context_parts
 
@@ -546,7 +615,31 @@ class GenerateDayDetailsNode(MultiAgentBase):
         day_details: list = []
         visited_attractions: list[str] = []
 
-        for day_alloc in sorted(skeleton.day_allocations, key=lambda d: d.day):
+        # Pre-sort allocations for prev/next city lookups
+        sorted_allocs = sorted(skeleton.day_allocations, key=lambda d: d.day)
+
+        # Compute per-day max attractions based on flight times
+        def _compute_max_attractions(day_num: int) -> int:
+            if day_num == 1:
+                # First day: arrival + 3h buffer
+                try:
+                    arr_h, _ = map(int, skeleton.departure_flight.arrival_time.split(":"))
+                    available_hours = max(0, 22 - (arr_h + 3))
+                except (ValueError, AttributeError):
+                    available_hours = 4  # conservative default
+                return max(1, int(available_hours / 2))
+            elif day_num == skeleton.days:
+                # Last day: departure - 3h buffer
+                try:
+                    dep_h, _ = map(int, skeleton.return_flight.departure_time.split(":"))
+                    available_hours = max(0, (dep_h - 3) - 9)
+                except (ValueError, AttributeError):
+                    available_hours = 3
+                return max(1, int(available_hours / 2))
+            else:
+                return 6  # mid-trip: max 6
+
+        for idx, day_alloc in enumerate(sorted_allocs):
             # Skip days that already passed validation (partial retry)
             if failed_days and day_alloc.day not in failed_days and day_alloc.day in existing_by_day:
                 existing = DayDetailOutput(**existing_by_day[day_alloc.day])
@@ -554,14 +647,37 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 visited_attractions.extend(existing.attractions)
                 continue
 
+            # Determine prev/next day cities for continuity
+            prev_last_city = ""
+            if idx > 0:
+                prev_cities = sorted_allocs[idx - 1].cities
+                prev_last_city = [c.strip() for c in prev_cities.split(",") if c.strip()][-1] if prev_cities else ""
+
+            next_first_city = ""
+            if idx < len(sorted_allocs) - 1:
+                next_cities = sorted_allocs[idx + 1].cities
+                next_first_city = [c.strip() for c in next_cities.split(",") if c.strip()][0] if next_cities else ""
+
+            max_attractions = _compute_max_attractions(day_alloc.day)
+
             # Build per-day prompt
             parts = [
                 f"## {day_alloc.day}일차 상세 기획",
                 f"- 날짜: {day_alloc.date} ({day_alloc.day_of_week})",
                 f"- 도시: {day_alloc.cities}",
                 f"- 숙소: {skeleton.hotels[day_alloc.day - 1] if day_alloc.day <= len(skeleton.hotels) else '(귀국일)'}",
-                f"- 항공편: 출발 {skeleton.departure_flight.arrival_time} / 귀국 {skeleton.return_flight.departure_time}",
+                f"- 항공편: 출발편 도착 {skeleton.departure_flight.arrival_time} / 귀국편 출발 {skeleton.return_flight.departure_time}",
                 f"- 전체 일정: {skeleton.days}일 중 {day_alloc.day}일차",
+                f"- **관광지 상한: {max_attractions}개** (절대 초과 금지)",
+            ]
+
+            # City continuity constraints
+            if prev_last_city:
+                parts.append(f"- 전날 마지막 도시: {prev_last_city} → 오늘 첫 도시와 동일해야 함")
+            if next_first_city:
+                parts.append(f"- 다음날 첫 도시: {next_first_city} → 오늘 마지막 도시와 동일해야 함")
+
+            parts.extend([
                 "",
                 rules_prompt,
                 "",
@@ -570,7 +686,7 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 "",
                 "## Graph 컨텍스트",
                 json.dumps(graph_context, ensure_ascii=False, default=str),
-            ]
+            ])
 
             correction = invocation_state.get(f"day_{day_alloc.day}_correction", "")
             if correction:

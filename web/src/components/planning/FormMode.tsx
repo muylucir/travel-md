@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Form from "@cloudscape-design/components/form";
@@ -23,6 +23,8 @@ import {
   HOTEL_GRADES,
 } from "@/lib/types";
 import SimilaritySlider from "../common/SimilaritySlider";
+import { usePackages } from "@/hooks/usePackages";
+import RecommendedPackageCards from "./RecommendedPackageCards";
 
 interface FormModeProps {
   onSubmit: (input: PlanningInput) => void;
@@ -44,6 +46,24 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
   const [mealPreference, setMealPreference] = useState("");
   const [hotelGrade, setHotelGrade] = useState("");
   const [naturalLanguageRequest, setNaturalLanguageRequest] = useState("");
+
+  const {
+    packages: recommendedPackages,
+    loading: recLoading,
+    error: recError,
+    refresh: recRefresh,
+  } = usePackages();
+
+  useEffect(() => {
+    const dest = destination || region;
+    if (!dest) return;
+    recRefresh({
+      destination: dest,
+      nights: parseInt(nights) || undefined,
+      theme: selectedThemes[0] || undefined,
+      limit: 5,
+    });
+  }, [destination, region, nights, season, selectedThemes, recRefresh]);
 
   const handleSubmit = () => {
     const input: PlanningInput = {
@@ -206,6 +226,16 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
                 placeholder="예: JKP130260401TWX"
               />
             </FormField>
+
+            {(destination || region) && (
+              <RecommendedPackageCards
+                packages={recommendedPackages}
+                loading={recLoading}
+                error={recError}
+                selectedCode={referenceProductId}
+                onSelect={(code) => setReferenceProductId(code)}
+              />
+            )}
 
             <SimilaritySlider
               value={similarityLevel}

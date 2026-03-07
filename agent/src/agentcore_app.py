@@ -335,7 +335,11 @@ async def _handle_planning(payload):
         if saved_code:
             result_data["product_code"] = saved_code
         from datetime import datetime, timezone
-        result_data["generated_at"] = datetime.now(timezone.utc).isoformat()
+        end_time_utc = datetime.now(timezone.utc)
+        result_data["generated_at"] = end_time_utc.isoformat()
+        result_data["planning_started_at"] = datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat()
+        result_data["planning_finished_at"] = end_time_utc.isoformat()
+        result_data["planning_elapsed_seconds"] = round(time.time() - start_time, 1)
 
         yield {"event": "result", "data": result_data}
 

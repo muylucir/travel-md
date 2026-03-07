@@ -25,6 +25,7 @@ export default function GraphExplorer() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+  const [expanding, setExpanding] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 500 });
 
@@ -91,6 +92,102 @@ export default function GraphExplorer() {
     setFilteredData({ nodes, links, stats });
   }, [selectedTypes, fullData]);
 
+  // Expand neighbors for a node
+  const expandNeighbors = useCallback(
+    async (nodeId: string) => {
+      if (!filteredData) return;
+      setExpanding(true);
+      try {
+        const res = await fetch(
+          `/api/graph/visualize/neighbors?id=${encodeURIComponent(nodeId)}`
+        );
+        if (!res.ok) return;
+        const neighborData: GraphData = await res.json();
+
+        // Merge new nodes/links into existing graph
+        const existingIds = new Set(filteredData.nodes.map((n) => n.id));
+        const newNodes = neighborData.nodes.filter(
+          (n) => !existingIds.has(n.id)
+        );
+        const existingEdgeKeys = new Set(
+          filteredData.links.map(
+            (l) => `${l.source}-${l.label}-${l.target}`
+          )
+        );
+        const allNodeIds = new Set([
+          ...filteredData.nodes.map((n) => n.id),
+          ...newNodes.map((n) => n.id),
+        ]);
+        const newLinks = neighborData.links.filter((l) => {
+          const src =
+            typeof l.source === "object"
+              ? (l.source as any).id
+              : l.source;
+          const tgt =
+            typeof l.target === "object"
+              ? (l.target as any).id
+              : l.target;
+          const key = `${src}-${l.label}-${tgt}`;
+          return (
+            !existingEdgeKeys.has(key) &&
+            allNodeIds.has(src) &&
+            allNodeIds.has(tgt)
+          );
+        });
+
+        const mergedNodes = [...filteredData.nodes, ...newNodes];
+        const mergedLinks = [...filteredData.links, ...newLinks];
+        const stats: Record<string, number> = {};
+        for (const n of mergedNodes) {
+          stats[n.type] = (stats[n.type] || 0) + 1;
+        }
+
+        const merged = { nodes: mergedNodes, links: mergedLinks, stats };
+        setFilteredData(merged);
+
+        // Also update fullData so filter toggle doesn't lose expanded nodes
+        if (fullData) {
+          const fullIds = new Set(fullData.nodes.map((n) => n.id));
+          const extraNodes = newNodes.filter((n) => !fullIds.has(n.id));
+          const fullEdgeKeys = new Set(
+            fullData.links.map(
+              (l) => `${l.source}-${l.label}-${l.target}`
+            )
+          );
+          const allFullIds = new Set([
+            ...fullData.nodes.map((n) => n.id),
+            ...extraNodes.map((n) => n.id),
+          ]);
+          const extraLinks = newLinks.filter((l) => {
+            const src =
+              typeof l.source === "object"
+                ? (l.source as any).id
+                : l.source;
+            const tgt =
+              typeof l.target === "object"
+                ? (l.target as any).id
+                : l.target;
+            return (
+              !fullEdgeKeys.has(`${src}-${l.label}-${tgt}`) &&
+              allFullIds.has(src) &&
+              allFullIds.has(tgt)
+            );
+          });
+          setFullData({
+            nodes: [...fullData.nodes, ...extraNodes],
+            links: [...fullData.links, ...extraLinks],
+            stats: merged.stats,
+          });
+        }
+      } catch {
+        // silently fail expansion
+      } finally {
+        setExpanding(false);
+      }
+    },
+    [filteredData, fullData]
+  );
+
   const availableTypes = fullData ? Object.keys(fullData.stats).sort() : [];
 
   return (
@@ -145,6 +242,7 @@ export default function GraphExplorer() {
                       <Box variant="small" color="text-body-secondary">
                         노드 {filteredData.nodes.length}개 / 엣지{" "}
                         {filteredData.links.length}개
+                        {expanding && " (확장 중...)"}
                       </Box>
                       <GraphLegend
                         types={
@@ -171,7 +269,10 @@ export default function GraphExplorer() {
                         />
                         <NodeDetailPanel
                           node={selectedNode}
+                          links={filteredData.links}
+                          allNodes={filteredData.nodes}
                           onClose={() => setSelectedNode(null)}
+                          onExpand={expandNeighbors}
                         />
                       </div>
                     </>

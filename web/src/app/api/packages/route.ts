@@ -5,6 +5,10 @@ import type { PackageNode } from "@/lib/types";
 
 const __ = gremlin.process.statics;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+const P = (gremlin.process as any).P;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const TextP = (gremlin.process as any).TextP;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const desc = (gremlin.process as any).order.desc;
 
 /**
@@ -32,14 +36,19 @@ export async function GET(request: NextRequest) {
     let traversal = g.V().hasLabel("Package");
 
     if (destination) {
-      // Filter packages that visit cities in the given region
+      // Filter packages that visit cities matching by name, region, or country
       traversal = g
         .V()
-        .hasLabel("City")
-        .has("region", destination)
-        .inE("VISITS")
-        .outV()
         .hasLabel("Package")
+        .where(
+          (__.out("VISITS") as any)
+            .hasLabel("City")
+            .or(
+              __.has("name", destination),
+              __.has("region", destination),
+              __.has("country", destination)
+            )
+        )
         .dedup();
     }
 
@@ -48,7 +57,7 @@ export async function GET(request: NextRequest) {
     }
 
     if (season) {
-      traversal = traversal.has("season", season);
+      traversal = traversal.has("season", TextP.containing(season));
     }
 
     if (nights) {
@@ -66,6 +75,46 @@ export async function GET(request: NextRequest) {
       const obj = mapToObject<Record<string, unknown>>(r as Map<string, unknown>);
       return normalizePackage(obj);
     });
+
+    // Batch-fetch travel cities for each package via VISITS edges
+    const packageCodes = packages.map((p) => p.code).filter(Boolean);
+    if (packageCodes.length > 0) {
+      try {
+        const cityResults = await g
+          .V()
+          .hasLabel("Package")
+          .has("code", P.within(packageCodes))
+          .project("code", "cities")
+          .by((__ as any).values("code"))
+          .by(
+            (__.out("VISITS") as any)
+              .hasLabel("City")
+              .dedup()
+              .values("name")
+              .fold()
+          )
+          .toList();
+
+        const cityMap = new Map<string, string>();
+        for (const row of cityResults) {
+          const obj = mapToObject<{ code: string; cities: string[] }>(
+            row as Map<string, unknown>
+          );
+          if (obj.code && Array.isArray(obj.cities) && obj.cities.length > 0) {
+            cityMap.set(obj.code, obj.cities.join(", "));
+          }
+        }
+
+        for (const pkg of packages) {
+          const cities = cityMap.get(pkg.code);
+          if (cities) {
+            pkg.travel_cities = cities;
+          }
+        }
+      } catch (cityErr) {
+        console.warn("[/api/packages] City lookup failed:", cityErr);
+      }
+    }
 
     return NextResponse.json(packages);
   } catch (error) {

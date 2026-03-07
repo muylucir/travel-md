@@ -108,10 +108,25 @@ export default function ForceGraph({
       nodeColor={nodeColor}
       nodeVal={nodeVal}
       nodeCanvasObject={nodeCanvasObject}
-      linkColor={() => "#d5dbdb"}
-      linkWidth={0.5}
-      linkDirectionalArrowLength={3}
-      linkDirectionalArrowRelPos={1}
+      linkColor={() => "#adb5bd"}
+      linkWidth={0.8}
+      linkDirectionalArrowLength={4}
+      linkDirectionalArrowRelPos={0.9}
+      linkLabel={(link: any) => (link as GraphLink).label}
+      linkCanvasObjectMode={() => "after"}
+      linkCanvasObject={(link: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
+        if (globalScale < 2) return;
+        const l = link as GraphLink & { source: { x: number; y: number }; target: { x: number; y: number } };
+        if (!l.source?.x || !l.target?.x) return;
+        const mx = (l.source.x + l.target.x) / 2;
+        const my = (l.source.y + l.target.y) / 2;
+        const fontSize = Math.max(8 / globalScale, 1.5);
+        ctx.font = `${fontSize}px Sans-Serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "#687078";
+        ctx.fillText(l.label, mx, my);
+      }}
       onNodeClick={handleNodeClick}
       cooldownTicks={100}
       warmupTicks={50}

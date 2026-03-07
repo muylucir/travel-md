@@ -27,6 +27,14 @@ LAYER_DESCRIPTIONS: Dict[str, str] = {
     "theme": "분위기/테마 (항상 변경 가능)",
 }
 
+LAYER_TOOL_MAP: Dict[str, list] = {
+    "route": ["get_routes_by_region", "get_nearby_cities"],
+    "hotel": ["get_hotels_by_city"],
+    "attraction": ["get_attractions_by_city"],
+    "activity": ["get_trends", "get_attractions_by_city"],
+    "theme": ["get_trends", "search_packages"],
+}
+
 
 def compute_change_rules(similarity: int) -> Dict[str, str]:
     """Determine retain/modify decision for each layer given a similarity level.
@@ -72,7 +80,11 @@ def format_rules_for_prompt(similarity: int) -> str:
         weight = LAYER_WEIGHTS[layer]
         desc = LAYER_DESCRIPTIONS[layer]
         icon = "RETAIN" if decision == "retain" else "MODIFY"
-        lines.append(f"- Layer [{layer}] (weight={weight:.2f}) {desc}: **{icon}**")
+        tool_hint = ""
+        if decision == "modify" and layer in LAYER_TOOL_MAP:
+            tools = ", ".join(LAYER_TOOL_MAP[layer])
+            tool_hint = f" → 활용 도구: {tools}"
+        lines.append(f"- Layer [{layer}] (weight={weight:.2f}) {desc}: **{icon}**{tool_hint}")
 
     lines.append("")
 

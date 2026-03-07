@@ -243,22 +243,31 @@ def _compute_effective_score(virality_score: int, decay_rate: float, date_str: s
     return virality_score * ((1 - decay_rate) ** months_elapsed)
 
 
-def get_trends(region: str, min_score: int = 30) -> str:
-    """Retrieve active trends and TrendSpot locations for a region."""
+def get_trends(region: str = "", country: str = "", city: str = "", min_score: int = 30) -> str:
+    """Retrieve active trends and TrendSpot locations for a region, country, or city."""
     g = get_connection()
+
+    # Build location filter
+    if city:
+        location_filter = __.out("LOCATED_IN").hasLabel("City").has("name", city)
+    elif region:
+        location_filter = __.out("LOCATED_IN").hasLabel("City").has("region", region)
+    elif country:
+        location_filter = __.out("LOCATED_IN").hasLabel("City").has("country", country)
+    else:
+        location_filter = __.out("LOCATED_IN").hasLabel("City")
 
     raw = (
         g.V().hasLabel("Trend")
         .has("virality_score", P.gte(min_score))
         .where(
-            __.out("FILMED_AT", "FEATURES")
-            .out("LOCATED_IN").hasLabel("City").has("region", region)
+            __.out("FILMED_AT", "FEATURES").where(location_filter)
         )
         .project("trend", "spots")
         .by(__.valueMap(True))
         .by(
             __.out("FILMED_AT", "FEATURES")
-            .where(__.out("LOCATED_IN").hasLabel("City").has("region", region))
+            .where(location_filter)
             .valueMap(True).fold()
         )
         .toList()
@@ -267,7 +276,7 @@ def get_trends(region: str, min_score: int = 30) -> str:
     trends = []
     for item in raw:
         trend_data = map_to_dict(item["trend"])
-        for field in ("keywords",):
+        for field in ("keywords", "evidence"):
             if field in trend_data:
                 trend_data[field] = parse_json_field(trend_data[field])
 
@@ -330,6 +339,159 @@ def get_similar_packages(package_code: str) -> str:
 # -------------------------------------------------------------------------
 # 8. get_nearby_cities
 # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# 9. upsert_trend
+# -------------------------------------------------------------------------
+def upsert_trend(
+    title: str,
+    type: str,
+    source: str,
+    date: str,
+    virality_score: int,
+    decay_rate: float,
+    keywords: list[str] | None = None,
+    evidence: list[dict] | None = None,
+) -> str:
+    """Upsert a Trend vertex in Neptune. Creates if not exists, updates if exists.
+
+    Args:
+        evidence: List of evidence items, each with keys like:
+            {"source": "youtube", "title": "...", "url": "...", "metric": "views: 1.2M"}
+    """
+    g = get_connection()
+
+    keywords_json = json.dumps(keywords or [], ensure_ascii=False)
+    evidence_json = json.dumps(evidence or [], ensure_ascii=False)
+
+    result = (
+        g.V()
+        .hasLabel("Trend")
+        .has("title", title)
+        .has("source", source)
+        .fold()
+        .coalesce(
+            __.unfold(),
+            __.addV("Trend").property("title", title).property("source", source),
+        )
+        .property("type", type)
+        .property("date", date)
+        .property("virality_score", virality_score)
+        .property("decay_rate", decay_rate)
+        .property("keywords", keywords_json)
+        .property("evidence", evidence_json)
+        .property("updated_at", datetime.now(timezone.utc).isoformat())
+        .valueMap(True)
+        .toList()
+    )
+
+    if not result:
+        return json.dumps({"error": "Failed to upsert trend"}, ensure_ascii=False)
+
+    trend = map_to_dict(result[0])
+    was_new = "created_at" not in trend or trend.get("updated_at") == trend.get("created_at")
+
+    return json.dumps(
+        {"trend_id": str(trend.get("id", "")), "status": "created" if was_new else "updated"},
+        ensure_ascii=False,
+    )
+
+
+# -------------------------------------------------------------------------
+# 10. upsert_trend_spot
+# -------------------------------------------------------------------------
+def upsert_trend_spot(
+    name: str,
+    description: str = "",
+    category: str = "",
+    lat: float = 0.0,
+    lng: float = 0.0,
+    photo_worthy: bool = False,
+) -> str:
+    """Upsert a TrendSpot vertex in Neptune."""
+    g = get_connection()
+
+    result = (
+        g.V()
+        .hasLabel("TrendSpot")
+        .has("name", name)
+        .fold()
+        .coalesce(
+            __.unfold(),
+            __.addV("TrendSpot").property("name", name),
+        )
+        .property("description", description)
+        .property("category", category)
+        .property("lat", lat)
+        .property("lng", lng)
+        .property("photo_worthy", photo_worthy)
+        .property("updated_at", datetime.now(timezone.utc).isoformat())
+        .valueMap(True)
+        .toList()
+    )
+
+    if not result:
+        return json.dumps({"error": "Failed to upsert trend spot"}, ensure_ascii=False)
+
+    spot = map_to_dict(result[0])
+    return json.dumps(
+        {"spot_id": str(spot.get("id", "")), "status": "created" if not description else "updated"},
+        ensure_ascii=False,
+    )
+
+
+# -------------------------------------------------------------------------
+# 11. link_trend_to_spot
+# -------------------------------------------------------------------------
+def link_trend_to_spot(
+    trend_title: str,
+    trend_source: str,
+    spot_name: str,
+    edge_label: str = "FEATURES",
+    city_name: str = "",
+) -> str:
+    """Link a Trend to a TrendSpot. Optionally link TrendSpot to City via LOCATED_IN."""
+    g = get_connection()
+
+    # Get Trend and TrendSpot vertices
+    trends = g.V().hasLabel("Trend").has("title", trend_title).has("source", trend_source).toList()
+    spots = g.V().hasLabel("TrendSpot").has("name", spot_name).toList()
+
+    if not trends:
+        return json.dumps({"error": f"Trend '{trend_title}' not found"}, ensure_ascii=False)
+    if not spots:
+        return json.dumps({"error": f"TrendSpot '{spot_name}' not found"}, ensure_ascii=False)
+
+    trend_v = trends[0]
+    spot_v = spots[0]
+
+    # Validate edge_label
+    if edge_label not in ("FILMED_AT", "FEATURES"):
+        edge_label = "FEATURES"
+
+    # Create Trend → TrendSpot edge (idempotent)
+    existing_edge = (
+        g.V(trend_v).outE(edge_label).where(__.inV().is_(spot_v)).toList()
+    )
+    if not existing_edge:
+        g.V(trend_v).addE(edge_label).to(spot_v).next()
+
+    # Link TrendSpot → City if city_name provided
+    if city_name:
+        cities = g.V().hasLabel("City").has("name", city_name).toList()
+        if cities:
+            city_v = cities[0]
+            existing_loc = (
+                g.V(spot_v).outE("LOCATED_IN").where(__.inV().is_(city_v)).toList()
+            )
+            if not existing_loc:
+                g.V(spot_v).addE("LOCATED_IN").to(city_v).next()
+
+    return json.dumps({"status": "linked"}, ensure_ascii=False)
+
+
+# -------------------------------------------------------------------------
+# 12. get_nearby_cities
+# -------------------------------------------------------------------------
 def get_nearby_cities(city: str, max_km: int = 100) -> str:
     """Find cities near the specified city within a maximum distance."""
     g = get_connection()
@@ -351,3 +513,27 @@ def get_nearby_cities(city: str, max_km: int = 100) -> str:
         cities.append(city_data)
 
     return json.dumps({"nearby_cities": cities, "count": len(cities)}, ensure_ascii=False, default=str)
+
+
+# -------------------------------------------------------------------------
+# 13. get_cities_by_country
+# -------------------------------------------------------------------------
+def get_cities_by_country(country: str) -> str:
+    """Get all cities for a country from the Knowledge Graph."""
+    g = get_connection()
+    results = (
+        g.V().hasLabel("City").has("country", country)
+        .valueMap("name", "region").toList()
+    )
+    cities = []
+    for r in results:
+        d = map_to_dict(r)
+        name = d.get("name")
+        if isinstance(name, list):
+            name = name[0]
+        region = d.get("region")
+        if isinstance(region, list):
+            region = region[0]
+        if name:
+            cities.append({"name": name, "region": region})
+    return json.dumps({"country": country, "cities": cities, "count": len(cities)}, ensure_ascii=False)

@@ -27,6 +27,10 @@ from tools.graph_tools import (
     get_trends,
     get_similar_packages,
     get_nearby_cities,
+    get_cities_by_country,
+    upsert_trend,
+    upsert_trend_spot,
+    link_trend_to_spot,
 )
 from tools.dynamodb_tools import (
     save_product,
@@ -48,6 +52,11 @@ TOOL_REGISTRY = {
     "get_trends": get_trends,
     "get_similar_packages": get_similar_packages,
     "get_nearby_cities": get_nearby_cities,
+    "get_cities_by_country": get_cities_by_country,
+    # Graph write tools (3)
+    "upsert_trend": upsert_trend,
+    "upsert_trend_spot": upsert_trend_spot,
+    "link_trend_to_spot": link_trend_to_spot,
     # DynamoDB tools (4)
     "save_product": save_product,
     "get_product": get_product,
@@ -95,5 +104,17 @@ def handler(event, context):
         return {"content": [{"type": "text", "text": result}]}
     except Exception as e:
         logger.error("Tool %s failed: %s\n%s", tool_name, e, traceback.format_exc())
+
+        # Reset Neptune connection on transport/connection errors so next
+        # invocation gets a fresh WebSocket.
+        err_msg = str(e).lower()
+        if any(kw in err_msg for kw in ("closing transport", "closed", "connection", "websocket")):
+            try:
+                from graph_client import reset_connection
+                reset_connection()
+                logger.info("Neptune connection reset after transport error")
+            except Exception:
+                pass
+
         error_msg = json.dumps({"error": str(e), "tool": tool_name}, ensure_ascii=False)
         return {"content": [{"type": "text", "text": error_msg}], "isError": True}

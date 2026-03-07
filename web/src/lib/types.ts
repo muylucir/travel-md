@@ -153,6 +153,9 @@ export interface PlanningOutput {
   trend_sources: string[];
   generated_at: string;
   generated_by: string;
+  planning_started_at?: string;
+  planning_finished_at?: string;
+  planning_elapsed_seconds?: number;
 }
 
 // ─── Chat Payload ───
@@ -209,6 +212,7 @@ export interface PackageNode {
   single_room_surcharge?: number;
   deposit_per_person?: number;
   source_url?: string;
+  travel_cities?: string;
 }
 
 export interface CityNode {
@@ -304,6 +308,8 @@ export const NODE_TYPE_COLORS: Record<string, string> = {
   Hotel: "#c33d69",
   Country: "#2ea597",
   Season: "#b8860b",
+  Trend: "#e6550d",
+  TrendSpot: "#fd8d3c",
 };
 
 // ─── Chat ───
