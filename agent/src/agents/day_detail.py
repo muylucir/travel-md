@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from strands import Agent
 from strands.models.bedrock import BedrockModel
+from strands.models.model import CacheConfig
 
 from src.config import OPUS_MODEL_ID
 from src.hooks import ValkeyCacheHook
@@ -20,6 +21,7 @@ def create_day_detail_agent() -> Agent:
     """
     model = BedrockModel(
         model_id=OPUS_MODEL_ID,
+        cache_config=CacheConfig(strategy="auto"),
         max_tokens=8192,
     )
 

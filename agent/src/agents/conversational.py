@@ -5,6 +5,7 @@ from __future__ import annotations
 from strands import Agent
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.models.bedrock import BedrockModel
+from strands.models.model import CacheConfig
 
 from src.config import SONNET_MODEL_ID
 from src.hooks import ValkeyCacheHook
@@ -21,6 +22,7 @@ def create_conversational_agent() -> Agent:
     """
     model = BedrockModel(
         model_id=SONNET_MODEL_ID,
+        cache_config=CacheConfig(strategy="auto"),
         max_tokens=8192,
     )
 
