@@ -9,6 +9,7 @@ from strands import Agent
 from strands.models.bedrock import BedrockModel
 
 from src.config import OPUS_MODEL_ID
+from src.hooks import ValkeyCacheHook
 from src.models.output import PlanningOutput
 from src.prompts.itinerary_system import ITINERARY_SYSTEM_PROMPT
 from src.mcp_connection import get_mcp_client
@@ -33,6 +34,7 @@ def create_itinerary_agent() -> Agent:
         system_prompt=ITINERARY_SYSTEM_PROMPT,
         tools=mcp_tools,
         structured_output_model=PlanningOutput,
+        hooks=[ValkeyCacheHook()],
     )
 
     return agent

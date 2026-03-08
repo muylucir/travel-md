@@ -7,6 +7,7 @@ from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.models.bedrock import BedrockModel
 
 from src.config import SONNET_MODEL_ID
+from src.hooks import ValkeyCacheHook
 from src.mcp_connection import get_mcp_client
 from src.prompts.conversational_system import CONVERSATIONAL_SYSTEM_PROMPT
 
@@ -20,7 +21,7 @@ def create_conversational_agent() -> Agent:
     """
     model = BedrockModel(
         model_id=SONNET_MODEL_ID,
-        max_tokens=4096,
+        max_tokens=8192,
     )
 
     mcp = get_mcp_client()
@@ -31,6 +32,7 @@ def create_conversational_agent() -> Agent:
         system_prompt=CONVERSATIONAL_SYSTEM_PROMPT,
         tools=mcp_tools,
         conversation_manager=SlidingWindowConversationManager(window_size=40),
+        hooks=[ValkeyCacheHook()],
     )
 
     return agent

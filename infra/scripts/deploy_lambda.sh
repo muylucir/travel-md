@@ -54,8 +54,12 @@ echo "==> Package created: $ZIP_FILE ($ZIP_SIZE)"
 
 ACTION="${1:-create}"
 
+# ElastiCache / Valkey (for cache invalidation tool)
+REDIS_HOST="${REDIS_HOST:-REDACTED_VALKEY_HOST}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+
 # Note: AWS_REGION is a Lambda reserved variable (auto-set to deploy region)
-ENV_VARS="Variables={GREMLIN_ENDPOINT=$GREMLIN_ENDPOINT,DYNAMODB_TABLE_NAME=$DYNAMODB_TABLE_NAME}"
+ENV_VARS="Variables={GREMLIN_ENDPOINT=$GREMLIN_ENDPOINT,DYNAMODB_TABLE_NAME=$DYNAMODB_TABLE_NAME,REDIS_HOST=$REDIS_HOST,REDIS_PORT=$REDIS_PORT}"
 
 if [ "$ACTION" = "create" ]; then
     echo "==> Creating Lambda function: $FUNCTION_NAME"

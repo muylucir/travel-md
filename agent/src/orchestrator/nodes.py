@@ -586,21 +586,84 @@ class ValidateSkeletonNode(MultiAgentBase):
 
 
 # ---------------------------------------------------------------------------
-# Node 7: Generate Day Details (Phase 2 — Opus, sequential per day)
+# Node 7: Generate Day Details (Phase 2 — Opus, parallel per day)
 # ---------------------------------------------------------------------------
 class GenerateDayDetailsNode(MultiAgentBase):
-    """Phase 2: Fill in per-day attractions, meals, activities."""
+    """Phase 2: Fill in per-day attractions, meals, activities.
+
+    Days are generated in parallel via ``asyncio.gather`` with separate
+    Agent instances.  To prevent duplicate attractions across days in the
+    same city, attractions from graph_context are pre-partitioned and each
+    day receives only its assigned subset.  The existing
+    ``ValidateDayDetailsNode`` catches any remaining duplicates.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self._agent = None
+
+    @staticmethod
+    def _compute_max_attractions(day_num: int, total_days: int, skeleton) -> int:
+        if day_num == 1:
+            try:
+                arr_h, _ = map(int, skeleton.departure_flight.arrival_time.split(":"))
+                available_hours = max(0, 22 - (arr_h + 3))
+            except (ValueError, AttributeError):
+                available_hours = 4
+            return max(1, int(available_hours / 2))
+        elif day_num == total_days:
+            try:
+                dep_h, _ = map(int, skeleton.return_flight.departure_time.split(":"))
+                available_hours = max(0, (dep_h - 3) - 9)
+            except (ValueError, AttributeError):
+                available_hours = 3
+            return max(1, int(available_hours / 2))
+        else:
+            return 6
+
+    @staticmethod
+    def _partition_attractions(sorted_allocs, graph_context: dict) -> dict[int, list[str]]:
+        """Pre-assign attractions to each day to prevent cross-day duplicates.
+
+        For days sharing the same city, attractions are round-robin split so
+        each day gets a disjoint subset.  Returns {day_num: [attraction_names]}.
+        """
+        city_attractions: dict = graph_context.get("city_attractions", {})
+        # Group days by city
+        city_days: dict[str, list] = {}
+        for alloc in sorted_allocs:
+            for city in [c.strip() for c in alloc.cities.split(",") if c.strip()]:
+                city_days.setdefault(city, []).append(alloc.day)
+
+        day_assigned: dict[int, list[str]] = {alloc.day: [] for alloc in sorted_allocs}
+
+        for city, days in city_days.items():
+            raw = city_attractions.get(city)
+            if not raw:
+                continue
+            # Extract attraction names from the graph context data
+            names: list[str] = []
+            if isinstance(raw, str):
+                for m in re.finditer(r'"name":\s*"([^"]+)"', raw):
+                    names.append(m.group(1))
+            elif isinstance(raw, dict):
+                for item in raw.get("attractions", raw.get("data", [])):
+                    if isinstance(item, dict) and "name" in item:
+                        names.append(item["name"])
+            elif isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict) and "name" in item:
+                        names.append(item["name"])
+
+            # Round-robin distribute attractions across days sharing this city
+            for i, name in enumerate(names):
+                target_day = days[i % len(days)]
+                day_assigned[target_day].append(name)
+
+        return day_assigned
 
     async def invoke_async(self, task, invocation_state=None, **kwargs):
         start = time.time()
         invocation_state = invocation_state or {}
-
-        if self._agent is None:
-            self._agent = create_day_detail_agent()
 
         skeleton_data = invocation_state.get("skeleton_output")
         skeleton = SkeletonOutput(**skeleton_data) if skeleton_data else invocation_state.get("skeleton_output_obj")
@@ -608,46 +671,28 @@ class GenerateDayDetailsNode(MultiAgentBase):
         rules_prompt = invocation_state.get("similarity_rules_prompt", "")
         failed_days = invocation_state.get("failed_days", [])
 
-        # Existing day details from previous iteration (for partial retry)
         existing_details = invocation_state.get("day_details_list", [])
         existing_by_day = {d["day"]: d for d in existing_details}
 
-        day_details: list = []
-        visited_attractions: list[str] = []
-
-        # Pre-sort allocations for prev/next city lookups
         sorted_allocs = sorted(skeleton.day_allocations, key=lambda d: d.day)
 
-        # Compute per-day max attractions based on flight times
-        def _compute_max_attractions(day_num: int) -> int:
-            if day_num == 1:
-                # First day: arrival + 3h buffer
-                try:
-                    arr_h, _ = map(int, skeleton.departure_flight.arrival_time.split(":"))
-                    available_hours = max(0, 22 - (arr_h + 3))
-                except (ValueError, AttributeError):
-                    available_hours = 4  # conservative default
-                return max(1, int(available_hours / 2))
-            elif day_num == skeleton.days:
-                # Last day: departure - 3h buffer
-                try:
-                    dep_h, _ = map(int, skeleton.return_flight.departure_time.split(":"))
-                    available_hours = max(0, (dep_h - 3) - 9)
-                except (ValueError, AttributeError):
-                    available_hours = 3
-                return max(1, int(available_hours / 2))
-            else:
-                return 6  # mid-trip: max 6
+        # Pre-partition attractions to eliminate sequential dependency
+        day_attractions = self._partition_attractions(sorted_allocs, graph_context)
+
+        # Collect already-confirmed attractions from existing (passed) days
+        existing_attractions: list[str] = []
+        for alloc in sorted_allocs:
+            if failed_days and alloc.day not in failed_days and alloc.day in existing_by_day:
+                existing = DayDetailOutput(**existing_by_day[alloc.day])
+                existing_attractions.extend(existing.attractions)
+
+        # Build prompts and identify days that need generation
+        generation_tasks: list[tuple[int, str]] = []  # (day_num, prompt)
 
         for idx, day_alloc in enumerate(sorted_allocs):
-            # Skip days that already passed validation (partial retry)
             if failed_days and day_alloc.day not in failed_days and day_alloc.day in existing_by_day:
-                existing = DayDetailOutput(**existing_by_day[day_alloc.day])
-                day_details.append(existing)
-                visited_attractions.extend(existing.attractions)
                 continue
 
-            # Determine prev/next day cities for continuity
             prev_last_city = ""
             if idx > 0:
                 prev_cities = sorted_allocs[idx - 1].cities
@@ -658,9 +703,8 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 next_cities = sorted_allocs[idx + 1].cities
                 next_first_city = [c.strip() for c in next_cities.split(",") if c.strip()][0] if next_cities else ""
 
-            max_attractions = _compute_max_attractions(day_alloc.day)
+            max_attr = self._compute_max_attractions(day_alloc.day, skeleton.days, skeleton)
 
-            # Build per-day prompt
             parts = [
                 f"## {day_alloc.day}일차 상세 기획",
                 f"- 날짜: {day_alloc.date} ({day_alloc.day_of_week})",
@@ -668,21 +712,31 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 f"- 숙소: {skeleton.hotels[day_alloc.day - 1] if day_alloc.day <= len(skeleton.hotels) else '(귀국일)'}",
                 f"- 항공편: 출발편 도착 {skeleton.departure_flight.arrival_time} / 귀국편 출발 {skeleton.return_flight.departure_time}",
                 f"- 전체 일정: {skeleton.days}일 중 {day_alloc.day}일차",
-                f"- **관광지 상한: {max_attractions}개** (절대 초과 금지)",
+                f"- **관광지 상한: {max_attr}개** (절대 초과 금지)",
             ]
 
-            # City continuity constraints
             if prev_last_city:
                 parts.append(f"- 전날 마지막 도시: {prev_last_city} → 오늘 첫 도시와 동일해야 함")
             if next_first_city:
                 parts.append(f"- 다음날 첫 도시: {next_first_city} → 오늘 마지막 도시와 동일해야 함")
 
+            # Assigned attractions for this day (pre-partitioned to avoid duplicates)
+            assigned = day_attractions.get(day_alloc.day, [])
+            # Other days' attractions to avoid
+            other_days_attractions = existing_attractions.copy()
+            for other_day, other_list in day_attractions.items():
+                if other_day != day_alloc.day:
+                    other_days_attractions.extend(other_list)
+
             parts.extend([
                 "",
                 rules_prompt,
                 "",
-                "## 이전 날짜 방문 관광지 (중복 금지)",
-                ", ".join(visited_attractions) if visited_attractions else "(없음)",
+                "## 이 일차에 배정된 추천 관광지",
+                ", ".join(assigned) if assigned else "(자유 선택)",
+                "",
+                "## 다른 일차 관광지 (중복 금지)",
+                ", ".join(set(other_days_attractions)) if other_days_attractions else "(없음)",
                 "",
                 "## Graph 컨텍스트",
                 json.dumps(graph_context, ensure_ascii=False, default=str),
@@ -692,28 +746,53 @@ class GenerateDayDetailsNode(MultiAgentBase):
             if correction:
                 parts.extend(["", "## 이전 검증 실패", correction, "위 문제를 수정하세요."])
 
-            result = self._agent("\n".join(parts))
-            day_detail: DayDetailOutput = result.structured_output
+            generation_tasks.append((day_alloc.day, "\n".join(parts)))
 
-            # Ensure day metadata matches skeleton
-            day_detail.day = day_alloc.day
-            day_detail.date = day_alloc.date
-            day_detail.day_of_week = day_alloc.day_of_week
-            day_detail.cities = day_alloc.cities
+        # --- Parallel generation with separate Agent instances ---
+        async def _generate_day(day_num: int, prompt: str) -> DayDetailOutput:
+            agent = create_day_detail_agent()
+            result = await asyncio.to_thread(agent, prompt)
+            detail: DayDetailOutput = result.structured_output
+            for alloc in sorted_allocs:
+                if alloc.day == day_num:
+                    detail.day = alloc.day
+                    detail.date = alloc.date
+                    detail.day_of_week = alloc.day_of_week
+                    detail.cities = alloc.cities
+                    break
+            logger.info("Day %d detail generated", day_num)
+            return detail
 
-            day_details.append(day_detail)
-            visited_attractions.extend(day_detail.attractions)
+        generated: dict[int, DayDetailOutput] = {}
+        if generation_tasks:
+            logger.info("Generating %d day details in parallel...", len(generation_tasks))
+            results = await asyncio.gather(
+                *[_generate_day(dn, p) for dn, p in generation_tasks],
+                return_exceptions=True,
+            )
+            for (day_num, _), result in zip(generation_tasks, results):
+                if isinstance(result, Exception):
+                    logger.error("Day %d generation failed: %s", day_num, result)
+                    raise result
+                generated[day_num] = result
 
-        # Merge into PlanningOutput
+        # Merge: existing (passed) days + newly generated days, sorted by day
+        day_details = []
+        for alloc in sorted_allocs:
+            if alloc.day in generated:
+                day_details.append(generated[alloc.day])
+            elif alloc.day in existing_by_day:
+                day_details.append(DayDetailOutput(**existing_by_day[alloc.day]))
+
         final_output = merge_skeleton_and_days(skeleton, day_details)
 
         invocation_state["planning_output"] = final_output.model_dump()
         invocation_state["planning_output_obj"] = final_output
         invocation_state["day_details_list"] = [d.model_dump() for d in day_details]
 
-        output_text = json.dumps({"days_generated": len(day_details)}, ensure_ascii=False)
+        output_text = json.dumps({"days_generated": len(generation_tasks)}, ensure_ascii=False)
         elapsed = time.time() - start
-        logger.info("GenerateDayDetailsNode completed in %.2fs (%d days)", elapsed, len(day_details))
+        logger.info("GenerateDayDetailsNode completed in %.2fs (%d days, parallel)", elapsed, len(generation_tasks))
 
         agent_result = _make_agent_result(output_text)
         return MultiAgentResult(

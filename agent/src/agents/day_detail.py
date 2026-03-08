@@ -6,6 +6,7 @@ from strands import Agent
 from strands.models.bedrock import BedrockModel
 
 from src.config import OPUS_MODEL_ID
+from src.hooks import ValkeyCacheHook
 from src.models.output import DayDetailOutput
 from src.mcp_connection import get_mcp_client
 from src.prompts.day_detail_system import DAY_DETAIL_SYSTEM_PROMPT
@@ -19,7 +20,7 @@ def create_day_detail_agent() -> Agent:
     """
     model = BedrockModel(
         model_id=OPUS_MODEL_ID,
-        max_tokens=4096,
+        max_tokens=8192,
     )
 
     mcp = get_mcp_client()
@@ -30,4 +31,5 @@ def create_day_detail_agent() -> Agent:
         system_prompt=DAY_DETAIL_SYSTEM_PROMPT,
         tools=mcp_tools,
         structured_output_model=DayDetailOutput,
+        hooks=[ValkeyCacheHook()],
     )

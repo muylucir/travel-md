@@ -31,6 +31,7 @@ from tools.graph_tools import (
     upsert_trend,
     upsert_trend_spot,
     link_trend_to_spot,
+    invalidate_cache,
 )
 from tools.dynamodb_tools import (
     save_product,
@@ -57,6 +58,8 @@ TOOL_REGISTRY = {
     "upsert_trend": upsert_trend,
     "upsert_trend_spot": upsert_trend_spot,
     "link_trend_to_spot": link_trend_to_spot,
+    # Cache management (1)
+    "invalidate_cache": invalidate_cache,
     # DynamoDB tools (4)
     "save_product": save_product,
     "get_product": get_product,

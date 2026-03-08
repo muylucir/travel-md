@@ -65,10 +65,13 @@ export async function invokeAgentCore(
   const signed = await signer.sign(request);
 
   const url = `https://${hostname}${path}?qualifier=DEFAULT`;
+  // 7+ night itineraries can take several minutes (parallel Opus per day).
+  // Extend fetch timeout to 10 minutes to prevent premature termination.
   return fetch(url, {
     method: "POST",
     headers: signed.headers as Record<string, string>,
     body,
+    signal: AbortSignal.timeout(600_000), // 10 minutes
   });
 }
 

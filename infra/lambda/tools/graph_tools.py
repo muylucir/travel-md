@@ -1,4 +1,4 @@
-"""8 Graph RAG tools for Lambda -- plain functions (no @tool decorator).
+"""Graph RAG tools + cache invalidation for Lambda.
 
 Reuses the Gremlin query logic from the agent tools but returns raw
 JSON strings suitable for the Lambda handler response.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from gremlin_python.process.graph_traversal import __
@@ -537,3 +538,59 @@ def get_cities_by_country(country: str) -> str:
         if name:
             cities.append({"name": name, "region": region})
     return json.dumps({"country": country, "cities": cities, "count": len(cities)}, ensure_ascii=False)
+
+
+# -------------------------------------------------------------------------
+# 14. invalidate_cache
+# -------------------------------------------------------------------------
+_redis_client = None
+
+
+def _get_redis():
+    """Lazy-init Redis client for cache invalidation."""
+    global _redis_client
+    if _redis_client is None:
+        import redis as redis_lib
+
+        _redis_client = redis_lib.Redis(
+            host=os.environ.get("REDIS_HOST", "REDACTED_VALKEY_HOST"),
+            port=int(os.environ.get("REDIS_PORT", "6379")),
+            ssl=True,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+    return _redis_client
+
+
+def invalidate_cache(tool_pattern: str = "", flush_all: bool = False) -> str:
+    """Delete cached MCP tool results from Valkey.
+
+    Args:
+        tool_pattern: Tool name to invalidate (e.g. 'get_trends').
+                      Deletes all ``mcp:{tool_pattern}:*`` keys.
+        flush_all: If True, delete ALL ``mcp:*`` keys.
+    """
+    try:
+        client = _get_redis()
+
+        if flush_all:
+            pattern = "mcp:*"
+        elif tool_pattern:
+            pattern = f"mcp:{tool_pattern}:*"
+        else:
+            return json.dumps({"error": "Provide tool_pattern or set flush_all=true"}, ensure_ascii=False)
+
+        deleted, cursor = 0, 0
+        while True:
+            cursor, keys = client.scan(cursor=cursor, match=pattern, count=100)
+            if keys:
+                deleted += client.delete(*keys)
+            if cursor == 0:
+                break
+
+        logger.info("Cache invalidation: pattern=%s, deleted=%d keys", pattern, deleted)
+        return json.dumps({"pattern": pattern, "deleted": deleted, "status": "ok"}, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Cache invalidation failed: %s", e)
+        return json.dumps({"error": str(e), "status": "failed"}, ensure_ascii=False)

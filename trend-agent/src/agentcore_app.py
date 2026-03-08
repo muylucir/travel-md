@@ -12,6 +12,7 @@ import time
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
 from src.agents.collector import create_collector_agent
+from src.mcp_connection import get_mcp_client
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -98,6 +99,18 @@ async def invoke(payload, context):
 
         elapsed = time.time() - start_time
         logger.info("Trend collection for %s completed in %.2fs", label, elapsed)
+
+        # Invalidate planning agent trend cache so fresh data is served
+        try:
+            mcp = get_mcp_client()
+            mcp.call_tool_sync(
+                tool_use_id="cache-inv-1",
+                name="travel-tools___invalidate_cache",
+                arguments={"tool_pattern": "get_trends"},
+            )
+            logger.info("Trend cache invalidated after collection for %s", label)
+        except Exception as inv_err:
+            logger.warning("Cache invalidation failed (non-fatal): %s", inv_err)
 
         # Try to extract JSON summary from agent response
         summary = None
