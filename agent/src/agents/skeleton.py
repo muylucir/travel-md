@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from strands import Agent
 from strands.models.bedrock import BedrockModel
+from strands.models.model import CacheConfig
 
 from src.config import SONNET_MODEL_ID
 from src.models.output import SkeletonOutput
@@ -18,6 +19,7 @@ def create_skeleton_agent() -> Agent:
     """
     model = BedrockModel(
         model_id=SONNET_MODEL_ID,
+        cache_config=CacheConfig(strategy="auto"),
         max_tokens=4096,
     )
 

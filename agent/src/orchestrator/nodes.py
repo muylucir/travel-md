@@ -35,6 +35,138 @@ from src.mcp_connection import get_mcp_client, prefixed
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Context summarization helpers (token optimization)
+# ---------------------------------------------------------------------------
+
+def _parse_mcp_text(raw) -> dict | list | None:
+    """Extract the inner JSON from an MCP ToolResult or raw string."""
+    if raw is None:
+        return None
+    try:
+        data = json.loads(str(raw)) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, dict) and "content" in data:
+        for block in data.get("content", []):
+            if isinstance(block, dict) and "text" in block:
+                try:
+                    return json.loads(block["text"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    return data
+
+
+def _summarize_reference(rp_raw) -> dict | None:
+    """Keep only package/cities/routes/hotels from reference_package."""
+    data = _parse_mcp_text(rp_raw)
+    if not isinstance(data, dict):
+        return data
+    return {k: v for k, v in data.items() if k in ("package", "cities", "routes", "hotels")}
+
+
+def _summarize_similar(sp_raw) -> list[dict] | None:
+    """Extract code/name/price/nights/rating from each similar package."""
+    data = _parse_mcp_text(sp_raw)
+    if not isinstance(data, dict):
+        return data
+    packages = data.get("packages", data.get("similar_packages", []))
+    if not isinstance(packages, list):
+        return data
+    summary = []
+    for item in packages:
+        pkg = item.get("package", item) if isinstance(item, dict) else item
+        if not isinstance(pkg, dict):
+            continue
+        summary.append({k: pkg[k] for k in ("code", "name", "price", "nights", "days", "rating", "region") if k in pkg})
+    return {"packages": summary, "count": len(summary)}
+
+
+def _count_attractions(city_attractions: dict) -> dict[str, int]:
+    """Summarize city_attractions to {city: count} for Skeleton."""
+    counts = {}
+    for city, raw in city_attractions.items():
+        data = _parse_mcp_text(raw)
+        if isinstance(data, dict):
+            counts[city] = data.get("count", len(data.get("attractions", [])))
+        elif isinstance(data, list):
+            counts[city] = len(data)
+        else:
+            counts[city] = str(raw).count('"name"')
+    return counts
+
+
+def _strip_evidence_urls(trends_raw) -> dict | None:
+    """Remove evidence[].url from trends data."""
+    data = _parse_mcp_text(trends_raw)
+    if not isinstance(data, dict):
+        return data
+    for trend_item in data.get("trends", []):
+        trend = trend_item.get("trend", trend_item)
+        if isinstance(trend, dict):
+            for ev in trend.get("evidence", []):
+                if isinstance(ev, dict):
+                    ev.pop("url", None)
+    return data
+
+
+def _filter_trends_by_cities(trends_raw, cities: list[str]) -> dict | None:
+    """Keep only trends whose spots are in the given cities."""
+    data = _strip_evidence_urls(trends_raw)
+    if not isinstance(data, dict):
+        return data
+    city_set = set(cities)
+    filtered = []
+    for trend_item in data.get("trends", []):
+        spots = trend_item.get("spots", [])
+        if not spots:
+            filtered.append(trend_item)
+            continue
+        for spot in spots:
+            spot_text = f"{spot.get('name', '')} {spot.get('description', '')} {spot.get('category', '')}"
+            if any(c in spot_text for c in city_set):
+                filtered.append(trend_item)
+                break
+    return {"trends": filtered, "count": len(filtered)}
+
+
+def _extract_day_attractions(rp_raw, day_num: int) -> list[dict]:
+    """Extract attractions for a specific day from reference_package."""
+    data = _parse_mcp_text(rp_raw)
+    if not isinstance(data, dict):
+        return []
+    return [
+        {"name": a.get("name"), "category": a.get("category")}
+        for a in data.get("attractions", [])
+        if isinstance(a, dict) and a.get("day") == day_num
+    ]
+
+
+def _build_skeleton_context(graph_context: dict) -> dict:
+    """Build a reduced graph_context for Skeleton."""
+    return {
+        "routes": graph_context.get("routes"),
+        "city_hotels": graph_context.get("city_hotels"),
+        "reference_package": _summarize_reference(graph_context.get("reference_package")),
+        "similar_packages": _summarize_similar(graph_context.get("similar_packages")),
+        "search_results": graph_context.get("search_results"),
+        "city_attraction_counts": _count_attractions(graph_context.get("city_attractions", {})),
+    }
+
+
+def _build_day_context(graph_context: dict, day_cities: list[str], day_num: int) -> dict:
+    """Build a filtered graph_context for a specific Day Detail."""
+    ca = graph_context.get("city_attractions", {})
+    ch = graph_context.get("city_hotels", {})
+    return {
+        "city_attractions": {c: ca[c] for c in day_cities if c in ca},
+        "city_hotels": {c: ch[c] for c in day_cities if c in ch},
+        "trends": _filter_trends_by_cities(graph_context.get("trends"), day_cities),
+        "reference_day_attractions": _extract_day_attractions(graph_context.get("reference_package"), day_num),
+    }
+
+
+
 def _make_agent_result(text: str) -> AgentResult:
     """Helper to wrap plain text into an AgentResult."""
     return AgentResult(
@@ -228,14 +360,14 @@ class CollectContextNode(MultiAgentBase):
                     for city_m in re.finditer(r'"([^"]+)"', m.group(1)):
                         cities_to_query.add(city_m.group(1))
 
-        # Extract cities from reference package
+        # Extract cities from reference package (parse JSON, not regex)
         rp = context_parts.get("reference_package")
         if rp:
-            rp_str = str(rp)
-            for m in re.finditer(r'"name":\s*"([^"]+)"', rp_str):
-                name = m.group(1)
-                if len(name) <= 8 and not any(c.isdigit() for c in name):
-                    cities_to_query.add(name)
+            rp_data = _parse_mcp_text(rp)
+            if isinstance(rp_data, dict):
+                for city in rp_data.get("cities", []):
+                    if isinstance(city, dict) and "name" in city:
+                        cities_to_query.add(city["name"])
 
         if city_hint:
             cities_to_query.add(city_hint)
@@ -508,8 +640,8 @@ class GenerateSkeletonNode(MultiAgentBase):
             "",
             rules_prompt,
             "",
-            "## Graph 컨텍스트",
-            json.dumps(graph_context, ensure_ascii=False, default=str),
+            "## Graph 컨텍스트 (Skeleton용 축약)",
+            json.dumps(_build_skeleton_context(graph_context), ensure_ascii=False, default=str),
         ]
 
         if correction_guide:
@@ -738,8 +870,8 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 "## 다른 일차 관광지 (중복 금지)",
                 ", ".join(set(other_days_attractions)) if other_days_attractions else "(없음)",
                 "",
-                "## Graph 컨텍스트",
-                json.dumps(graph_context, ensure_ascii=False, default=str),
+                "## Graph 컨텍스트 (이 일차 도시 관련만)",
+                json.dumps(_build_day_context(graph_context, [c.strip() for c in day_alloc.cities.split(",") if c.strip()], day_alloc.day), ensure_ascii=False, default=str),
             ])
 
             correction = invocation_state.get(f"day_{day_alloc.day}_correction", "")
