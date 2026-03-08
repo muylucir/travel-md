@@ -22,7 +22,8 @@
     "next": "latest",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-force-graph-2d": "^1.27.4"
+    "react-force-graph-2d": "^1.27.4",
+    "recharts": "^3.7.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

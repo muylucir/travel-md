@@ -1,4 +1,5 @@
-strands-agents>=0.1.0
+strands-agents[otel]>=0.1.0
+aws-opentelemetry-distro
 strands-agents-tools>=0.1.0
 bedrock-agentcore>=0.1.0
 mcp>=1.0.0

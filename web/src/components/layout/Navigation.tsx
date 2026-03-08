@@ -43,6 +43,11 @@ export default function Navigation() {
             },
             {
               type: "link",
+              text: "트렌드 관리",
+              href: "/trends",
+            },
+            {
+              type: "link",
               text: "그래프 탐색기",
               href: "/graph",
             },

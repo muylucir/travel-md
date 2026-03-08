@@ -20,7 +20,7 @@ def create_skeleton_agent() -> Agent:
     model = BedrockModel(
         model_id=SONNET_MODEL_ID,
         cache_config=CacheConfig(strategy="auto"),
-        max_tokens=4096,
+        max_tokens=8192,
     )
 
     return Agent(

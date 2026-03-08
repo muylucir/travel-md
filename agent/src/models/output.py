@@ -253,6 +253,7 @@ class DayDetailOutput(BaseModel):
     attractions: List[str] = Field(default_factory=list, description="Attraction names in visit order")
     attraction_details: List[Attraction] = Field(default_factory=list, description="Name + description for each attraction")
     highlights: List[str] = Field(default_factory=list, description="Day-specific highlights (1-2 lines)")
+    trend_spots_used: List[str] = Field(default_factory=list, description="이 날짜에 삽입된 트렌드 스팟 이름")
 
 
 # ─── Merge Function ───
@@ -265,6 +266,7 @@ def merge_skeleton_and_days(
     itinerary: List[DayItinerary] = []
     all_attractions: List[Attraction] = []
     all_highlights: List[str] = []
+    all_trend_spots: List[str] = []
 
     for detail in sorted(day_details, key=lambda d: d.day):
         itinerary.append(DayItinerary(
@@ -276,6 +278,7 @@ def merge_skeleton_and_days(
         ))
         all_attractions.extend(detail.attraction_details)
         all_highlights.extend(detail.highlights)
+        all_trend_spots.extend(detail.trend_spots_used)
 
     # Deduplicate attractions by name
     seen: set[str] = set()
@@ -284,6 +287,14 @@ def merge_skeleton_and_days(
         if attr.name not in seen:
             seen.add(attr.name)
             unique_attractions.append(attr)
+
+    # Aggregate trend info from day details (order-preserving dedup)
+    unique_trends = list(dict.fromkeys(all_trend_spots))
+
+    # Update changes_summary with trend info
+    merged_changes = skeleton.changes_summary.model_copy(
+        update={"trend_added": unique_trends}
+    )
 
     return PlanningOutput(
         package_name=skeleton.package_name,
@@ -315,5 +326,6 @@ def merge_skeleton_and_days(
         region=skeleton.region,
         similarity_score=skeleton.similarity_score,
         reference_products=skeleton.reference_products,
-        changes_summary=skeleton.changes_summary,
+        changes_summary=merged_changes,
+        trend_sources=unique_trends,
     )

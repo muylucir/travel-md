@@ -19,7 +19,7 @@ def create_chat_parser_agent() -> Agent:
     """
     sonnet_model = BedrockModel(
         model_id=SONNET_MODEL_ID,
-        max_tokens=4096,
+        max_tokens=8192,
     )
 
     agent = Agent(

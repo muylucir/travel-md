@@ -22,7 +22,7 @@ export default function AppLayout({
         <TopNavigation
           identity={{
             href: "/",
-            title: "OTA 여행상품 기획 에이전트",
+            title: "여행상품 기획 에이전트",
           }}
           utilities={[
             {

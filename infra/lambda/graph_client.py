@@ -52,11 +52,40 @@ def _get_neptune_headers() -> dict[str, str]:
     return dict(request.headers)
 
 
+def _is_connection_alive() -> bool:
+    """Check if the existing connection is still usable."""
+    if _connection is None:
+        return False
+    try:
+        client = getattr(_connection, "_client", None)
+        if client is None:
+            return False
+        transport = getattr(client, "_transport", None)
+        if transport is None:
+            return True  # can't check, assume alive
+        # Check if the underlying transport/socket is closed
+        if hasattr(transport, "_closed") and transport._closed:
+            return False
+        if hasattr(transport, "closed") and transport.closed:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def get_connection() -> GraphTraversalSource:
-    """Return a Gremlin traversal source ``g``, reused across warm invocations."""
+    """Return a Gremlin traversal source ``g``, reused across warm invocations.
+
+    Automatically reconnects if the WebSocket has been closed.
+    """
     global _connection, _g
-    if _g is not None:
+    if _g is not None and _is_connection_alive():
         return _g
+
+    # Connection is dead or doesn't exist — (re)create
+    if _connection is not None:
+        logger.info("Stale connection detected, reconnecting...")
+        reset_connection()
 
     logger.info("Opening Gremlin connection to %s", GREMLIN_ENDPOINT)
     headers = _get_neptune_headers()
