@@ -93,6 +93,7 @@ class TrendNode(TypedDict):
     virality_score: int
     decay_rate: float
     keywords: NotRequired[List[str]]
+    tier: NotRequired[str]
 
 
 class TrendSpotNode(TypedDict):

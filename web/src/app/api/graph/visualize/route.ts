@@ -1,12 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
+import { valkeyGet, valkeySet, ValkeyTTL } from "@/lib/valkey";
 import gremlin from "gremlin";
+import type { GraphData } from "@/lib/types";
 
-const __ = gremlin.process.statics;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const __ = gremlin.process.statics as any;
 
 /**
  * GET /api/graph/visualize
  * Full knowledge graph visualization data.
+ * Two-tier cache: L1 in-memory (10min) → L2 Valkey (1h) → Neptune.
  *
  * Query params:
  *   types - comma-separated node type filter (e.g., "Package,City")
@@ -18,6 +23,18 @@ export async function GET(request: NextRequest) {
     const types = typesParam
       ? typesParam.split(",").map((t) => t.trim()).filter(Boolean)
       : [];
+
+    // --- L1: in-memory cache ---
+    const cacheKey = `graph:${types.join(",") || "all"}`;
+    const l1 = cacheGet<GraphData>(cacheKey);
+    if (l1) return NextResponse.json(l1);
+
+    // --- L2: Valkey cache ---
+    const l2 = await valkeyGet<GraphData>(cacheKey);
+    if (l2) {
+      cacheSet(cacheKey, l2, TTL.STATIC);
+      return NextResponse.json(l2);
+    }
 
     const g = await getTraversal();
 
@@ -51,7 +68,7 @@ export async function GET(request: NextRequest) {
     const nodeIdSet = new Set(nodes.map((n: { id: string }) => n.id));
     const nodeIds = Array.from(nodeIdSet);
 
-    // 2. Fetch edges between these vertices
+    // 2. Fetch edges between these vertices using project() for reliable extraction
     let edges: Array<{ id: string; source: string; target: string; label: string }> = [];
     if (nodeIds.length > 0) {
       const batchSize = 200;
@@ -62,25 +79,21 @@ export async function GET(request: NextRequest) {
           .bothE()
           .where(__.otherV().hasId(...nodeIds))
           .dedup()
+          .project("id", "label", "source", "target")
+          .by(__.id())
+          .by(__.label())
+          .by(__.outV().id())
+          .by(__.inV().id())
           .toList();
 
         for (const e of edgeResults) {
           const obj = mapToObject<Record<string, unknown>>(
             e as Map<string, unknown>
           );
-          const edgeId = String(obj.id ?? obj["T.id"] ?? "");
-          const edgeLabel = String(obj.label ?? obj["T.label"] ?? "");
-
-          let source = "";
-          let target = "";
-          if (obj.outV && typeof obj.outV === "object") {
-            const outObj = obj.outV as Record<string, unknown>;
-            source = String(outObj.id ?? outObj["T.id"] ?? "");
-          }
-          if (obj.inV && typeof obj.inV === "object") {
-            const inObj = obj.inV as Record<string, unknown>;
-            target = String(inObj.id ?? inObj["T.id"] ?? "");
-          }
+          const edgeId = String(obj.id ?? "");
+          const edgeLabel = String(obj.label ?? "");
+          const source = String(obj.source ?? "");
+          const target = String(obj.target ?? "");
 
           if (source && target && nodeIdSet.has(source) && nodeIdSet.has(target)) {
             edges.push({ id: edgeId, source, target, label: edgeLabel });
@@ -105,7 +118,13 @@ export async function GET(request: NextRequest) {
       stats[n.type] = (stats[n.type] || 0) + 1;
     }
 
-    return NextResponse.json({ nodes, links: edges, stats });
+    const result: GraphData = { nodes, links: edges, stats };
+
+    // Store in both tiers
+    cacheSet(cacheKey, result, TTL.STATIC);
+    valkeySet(cacheKey, result, ValkeyTTL.GRAPH_STATIC);
+
+    return NextResponse.json(result);
   } catch (error) {
     console.error("[/api/graph/visualize] Error:", error);
     return NextResponse.json(

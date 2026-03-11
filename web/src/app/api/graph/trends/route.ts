@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTraversal, mapToObject, parseJsonProperty } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import gremlin from "gremlin";
 
 const __ = gremlin.process.statics;
@@ -10,6 +11,7 @@ const P = (gremlin.process as any).P;
  * GET /api/graph/trends?region=xxx&country=xxx&city=xxx&min_score=0
  * Returns trends with spots from Neptune, with time-decay scoring.
  * Filters: city (most specific) > region > country. If all omitted, returns all trends.
+ * Cached for 5 min; invalidated when trends are collected.
  */
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
@@ -17,6 +19,12 @@ export async function GET(request: NextRequest) {
   const country = searchParams.get("country") || "";
   const city = searchParams.get("city") || "";
   const minScore = parseInt(searchParams.get("min_score") || "0", 10);
+
+  const cacheKey = `trends:${region}:${country}:${city}:${minScore}`;
+  const cached = cacheGet<{ trends: unknown[]; count: number }>(cacheKey);
+  if (cached) {
+    return NextResponse.json(cached);
+  }
 
   try {
     const g = await getTraversal();
@@ -148,13 +156,21 @@ export async function GET(request: NextRequest) {
         effective_score: Math.round(effectiveScore * 10) / 10,
         spots,
         evidence,
+        tier: (() => {
+          const serverTier = String(val("tier") || "");
+          if (serverTier === "hot" || serverTier === "steady" || serverTier === "seasonal") return serverTier;
+          return decay <= 0.10 ? "hot" : decay <= 0.25 ? "steady" : "seasonal";
+        })(),
       });
     }
 
     // Sort by effective score descending
     trends.sort((a, b) => b.effective_score - a.effective_score);
 
-    return NextResponse.json({ trends, count: trends.length });
+    const result = { trends, count: trends.length };
+    cacheSet(cacheKey, result, TTL.TRENDS);
+
+    return NextResponse.json(result);
   } catch (error) {
     console.error("[/api/graph/trends] Error:", error);
     return NextResponse.json(

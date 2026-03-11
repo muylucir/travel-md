@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { AttractionNode } from "@/lib/types";
 
 /**
@@ -22,6 +23,10 @@ export async function GET(request: NextRequest) {
         { status: 400 }
       );
     }
+
+    const cacheKey = `attractions:${city}:${category || ""}`;
+    const cached = cacheGet<AttractionNode[]>(cacheKey);
+    if (cached) return NextResponse.json(cached);
 
     const g = await getTraversal();
     let traversal = g
@@ -55,6 +60,7 @@ export async function GET(request: NextRequest) {
       };
     });
 
+    cacheSet(cacheKey, attractions, TTL.STATIC);
     return NextResponse.json(attractions);
   } catch (error) {
     console.error("[/api/graph/attractions] Error:", error);

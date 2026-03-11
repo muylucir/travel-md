@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { invokeTrendCollector } from "@/lib/agentcore";
+import { cacheInvalidate } from "@/lib/api-cache";
 
 /**
  * POST /api/trends/collect
@@ -96,6 +97,9 @@ export async function POST(request: NextRequest) {
             send(evt.event, evt.data);
           }
         }
+
+        // Invalidate trend caches so the dashboard shows fresh data
+        cacheInvalidate("trends:");
       } catch (error) {
         console.error("[/api/trends/collect] Error:", error);
         const msg =

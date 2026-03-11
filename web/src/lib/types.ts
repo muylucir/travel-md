@@ -18,6 +18,7 @@ export interface PlanningInput {
   max_shopping_count?: number;
   meal_preference?: string;
   hotel_grade?: string;
+  trend_mix?: { hot: number; steady: number };
   input_mode: "chat" | "form";
 }
 
@@ -264,6 +265,7 @@ export interface TrendNode {
   virality_score: number;
   decay_rate: number;
   keywords?: string[];
+  tier?: "hot" | "steady" | "seasonal";
 }
 
 export interface TrendSpotNode {

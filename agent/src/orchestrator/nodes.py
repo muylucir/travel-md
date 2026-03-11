@@ -47,13 +47,21 @@ def _parse_mcp_text(raw) -> dict | list | None:
         data = json.loads(str(raw)) if isinstance(raw, str) else raw
     except (json.JSONDecodeError, TypeError):
         return None
+    # Determine content blocks to unwrap (MCP ToolResult or cached content list)
+    blocks = None
     if isinstance(data, dict) and "content" in data:
-        for block in data.get("content", []):
+        blocks = data.get("content", [])
+    elif isinstance(data, list):
+        blocks = data
+
+    if blocks:
+        for block in blocks:
             if isinstance(block, dict) and "text" in block:
                 try:
                     return json.loads(block["text"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+
     return data
 
 
@@ -154,17 +162,123 @@ def _build_skeleton_context(graph_context: dict) -> dict:
     }
 
 
-def _build_day_context(graph_context: dict, day_cities: list[str], day_num: int) -> dict:
+def _resolve_trend_mix(planning_input: dict) -> dict[str, int]:
+    """Resolve trend_mix from planning input; default hot 70 : steady 30."""
+    mix = planning_input.get("trend_mix") if isinstance(planning_input, dict) else None
+    if isinstance(mix, dict) and mix.get("hot") is not None:
+        return mix
+    return {"hot": 70, "steady": 30}
+
+
+def _infer_tier_agent(decay_rate: float) -> str:
+    """Infer trend tier from decay_rate (agent-side fallback)."""
+    if decay_rate <= 0.10:
+        return "hot"
+    if decay_rate <= 0.25:
+        return "steady"
+    return "seasonal"
+
+
+def _distribute_trends_by_tier(
+    filtered: dict | list | str | None,
+    trend_mix: dict[str, int],
+    max_total: int = 5,
+) -> dict | list | str | None:
+    """Distribute trends by tier ratio, returning the same structure.
+
+    Parses filtered (may be JSON string, dict, or list), groups by tier,
+    selects proportionally by trend_mix, and returns in original format.
+    """
+    import math
+
+    # Parse to list of trend items
+    if filtered is None:
+        return filtered
+    items: list[dict] = []
+    raw = filtered
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return filtered
+    if isinstance(raw, dict):
+        items = raw.get("trends", [])
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        return filtered
+
+    if not items:
+        return filtered
+
+    # Group by tier
+    groups: dict[str, list[dict]] = {"hot": [], "steady": [], "seasonal": []}
+    for item in items:
+        trend = item.get("trend", item) if isinstance(item, dict) else item
+        decay = float(trend.get("decay_rate", 0.1)) if isinstance(trend, dict) else 0.1
+        tier = (trend.get("tier") if isinstance(trend, dict) else None) or _infer_tier_agent(decay)
+        groups.setdefault(tier, []).append(item)
+
+    # Sort each group by effective_score descending
+    for tier_items in groups.values():
+        tier_items.sort(
+            key=lambda x: float(x.get("effective_score", 0)) if isinstance(x, dict) else 0,
+            reverse=True,
+        )
+
+    # Compute allocation
+    total_pct = sum(trend_mix.get(t, 0) for t in ("hot", "steady"))
+    result: list[dict] = []
+    remaining_slots = max_total
+
+    for tier in ("hot", "steady", "seasonal"):
+        pct = trend_mix.get(tier, 0)
+        if total_pct > 0 and pct > 0:
+            n = max(1, math.floor(max_total * pct / total_pct))
+        elif tier == "seasonal":
+            n = 0  # seasonal only fills remaining
+        else:
+            n = 0
+        take = min(n, len(groups.get(tier, [])), remaining_slots)
+        result.extend(groups.get(tier, [])[:take])
+        remaining_slots -= take
+        # Remove taken from group
+        if tier in groups:
+            groups[tier] = groups[tier][take:]
+
+    # Fill remaining slots from leftovers (hot first, then steady, then seasonal)
+    if remaining_slots > 0:
+        for tier in ("hot", "steady", "seasonal"):
+            leftover = groups.get(tier, [])
+            take = min(len(leftover), remaining_slots)
+            result.extend(leftover[:take])
+            remaining_slots -= take
+            if remaining_slots <= 0:
+                break
+
+    # Return in original format
+    if isinstance(filtered, str):
+        if isinstance(json.loads(filtered), dict):
+            return json.dumps({"trends": result, "count": len(result)}, ensure_ascii=False, default=str)
+        return json.dumps(result, ensure_ascii=False, default=str)
+    if isinstance(filtered, dict):
+        return {"trends": result, "count": len(result)}
+    return result
+
+
+def _build_day_context(graph_context: dict, day_cities: list[str], day_num: int, trend_mix: dict | None = None) -> dict:
     """Build a filtered graph_context for a specific Day Detail."""
     ca = graph_context.get("city_attractions", {})
     ch = graph_context.get("city_hotels", {})
+    filtered_trends = _filter_trends_by_cities(graph_context.get("trends"), day_cities)
+    if trend_mix:
+        filtered_trends = _distribute_trends_by_tier(filtered_trends, trend_mix)
     return {
         "city_attractions": {c: ca[c] for c in day_cities if c in ca},
         "city_hotels": {c: ch[c] for c in day_cities if c in ch},
-        "trends": _filter_trends_by_cities(graph_context.get("trends"), day_cities),
+        "trends": filtered_trends,
         "reference_day_attractions": _extract_day_attractions(graph_context.get("reference_package"), day_num),
     }
-
 
 
 def _make_agent_result(text: str) -> AgentResult:
@@ -800,6 +914,8 @@ class GenerateDayDetailsNode(MultiAgentBase):
         skeleton_data = invocation_state.get("skeleton_output")
         skeleton = SkeletonOutput(**skeleton_data) if skeleton_data else invocation_state.get("skeleton_output_obj")
         graph_context = invocation_state.get("graph_context", {})
+        planning_input = invocation_state.get("planning_input_parsed", {})
+        trend_mix = _resolve_trend_mix(planning_input)
         rules_prompt = invocation_state.get("similarity_rules_prompt", "")
         failed_days = invocation_state.get("failed_days", [])
 
@@ -871,7 +987,9 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 ", ".join(set(other_days_attractions)) if other_days_attractions else "(없음)",
                 "",
                 "## Graph 컨텍스트 (이 일차 도시 관련만)",
-                json.dumps(_build_day_context(graph_context, [c.strip() for c in day_alloc.cities.split(",") if c.strip()], day_alloc.day), ensure_ascii=False, default=str),
+                json.dumps(_build_day_context(graph_context, [c.strip() for c in day_alloc.cities.split(",") if c.strip()], day_alloc.day, trend_mix=trend_mix), ensure_ascii=False, default=str),
+                "",
+                f"## 트렌드 배합: hot {trend_mix.get('hot', 0)}% / steady {trend_mix.get('steady', 0)}%",
             ])
 
             correction = invocation_state.get(f"day_{day_alloc.day}_correction", "")

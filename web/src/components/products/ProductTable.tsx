@@ -4,9 +4,11 @@ import { useRouter } from "next/navigation";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
 import Button from "@cloudscape-design/components/button";
+import Pagination from "@cloudscape-design/components/pagination";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
+import { useCollection } from "@cloudscape-design/collection-hooks";
 import type { PlanningOutput } from "@/lib/types";
 
 interface ProductTableProps {
@@ -14,6 +16,19 @@ interface ProductTableProps {
   loading: boolean;
   onRefresh: () => void;
   onDelete: (code: string) => void;
+}
+
+const PAGE_SIZE = 10;
+
+function formatDateTime(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "-";
+  const yyyy = d.getFullYear();
+  const MM = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const HH = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${yyyy}-${MM}-${dd} ${HH}:${mm}`;
 }
 
 export default function ProductTable({
@@ -24,8 +39,19 @@ export default function ProductTable({
 }: ProductTableProps) {
   const router = useRouter();
 
+  const { items, collectionProps, paginationProps } = useCollection(products, {
+    pagination: { pageSize: PAGE_SIZE },
+    sorting: {
+      defaultState: {
+        sortingColumn: { sortingField: "generated_at" },
+        isDescending: true,
+      },
+    },
+  });
+
   return (
     <Table
+      {...collectionProps}
       header={
         <Header
           variant="h2"
@@ -39,6 +65,7 @@ export default function ProductTable({
           기획 상품 목록
         </Header>
       }
+      pagination={<Pagination {...paginationProps} />}
       columnDefinitions={[
         {
           id: "product_code",
@@ -87,21 +114,23 @@ export default function ProductTable({
               ? `${item.pricing.adult_price.toLocaleString()}원`
               : "-",
           width: 130,
+          sortingField: "pricing.adult_price",
+          sortingComparator: (a, b) =>
+            (a.pricing?.adult_price ?? 0) - (b.pricing?.adult_price ?? 0),
         },
         {
           id: "similarity",
           header: "유사도",
           cell: (item) => `${item.similarity_score}%`,
           width: 80,
+          sortingField: "similarity_score",
         },
         {
           id: "generated_at",
-          header: "생성일",
+          header: "생성일시",
           cell: (item) =>
-            item.generated_at
-              ? new Date(item.generated_at).toLocaleDateString("ko-KR")
-              : "-",
-          width: 110,
+            item.generated_at ? formatDateTime(item.generated_at) : "-",
+          width: 150,
           sortingField: "generated_at",
         },
         {
@@ -120,7 +149,7 @@ export default function ProductTable({
           width: 60,
         },
       ]}
-      items={products}
+      items={items}
       loading={loading}
       loadingText="기획 상품 불러오는 중..."
       empty={

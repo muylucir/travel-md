@@ -150,6 +150,7 @@ export default function TrendDashboard() {
     const counts: Record<TrendStatus, number> = {
       hot: 0,
       steady: 0,
+      seasonal: 0,
       emerging: 0,
       stale: 0,
     };
@@ -240,7 +241,7 @@ export default function TrendDashboard() {
         {/* Summary cards */}
         <Container header={<Header variant="h2">트렌드 현황</Header>}>
           {isOverview ? (
-            <ColumnLayout columns={4} variant="text-grid">
+            <ColumnLayout columns={5} variant="text-grid">
               <div>
                 <Box variant="awsui-key-label">전체 트렌드</Box>
                 <Box variant="awsui-value-large">
@@ -267,6 +268,18 @@ export default function TrendDashboard() {
                   ) : (
                     <span style={{ color: "#0972d3" }}>
                       {statusCounts.steady}개
+                    </span>
+                  )}
+                </Box>
+              </div>
+              <div>
+                <Box variant="awsui-key-label">시즌</Box>
+                <Box variant="awsui-value-large">
+                  {loading ? (
+                    <Spinner />
+                  ) : (
+                    <span style={{ color: "#e07941" }}>
+                      {statusCounts.seasonal}개
                     </span>
                   )}
                 </Box>

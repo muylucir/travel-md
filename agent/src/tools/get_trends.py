@@ -29,6 +29,15 @@ def _compute_effective_score(virality_score: int, decay_rate: float, date_str: s
     return virality_score * ((1 - decay_rate) ** months_elapsed)
 
 
+def _infer_tier(decay_rate: float) -> str:
+    """Infer trend tier from decay_rate. Used as fallback when tier is not stored."""
+    if decay_rate <= 0.10:
+        return "hot"
+    if decay_rate <= 0.25:
+        return "steady"
+    return "seasonal"
+
+
 @tool
 def get_trends(region: str, min_score: int = 30) -> str:
     """Retrieve active trends and their associated TrendSpot locations for a region.
@@ -91,8 +100,9 @@ def get_trends(region: str, min_score: int = 30) -> str:
 
         spots = [map_to_dict(s) for s in item.get("spots", [])]
 
+        tier = trend_data.get("tier") or _infer_tier(float(decay) if decay else 0.1)
         trends.append({
-            "trend": trend_data,
+            "trend": {**trend_data, "tier": tier},
             "effective_score": round(effective, 1),
             "spots": spots,
         })

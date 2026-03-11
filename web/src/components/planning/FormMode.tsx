@@ -23,6 +23,7 @@ import {
   HOTEL_GRADES,
 } from "@/lib/types";
 import SimilaritySlider from "../common/SimilaritySlider";
+import TrendMixSlider from "../common/TrendMixSlider";
 import { usePackages } from "@/hooks/usePackages";
 import RecommendedPackageCards from "./RecommendedPackageCards";
 
@@ -46,6 +47,7 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
   const [mealPreference, setMealPreference] = useState("");
   const [hotelGrade, setHotelGrade] = useState("");
   const [naturalLanguageRequest, setNaturalLanguageRequest] = useState("");
+  const [trendMixHot, setTrendMixHot] = useState(70);
 
   const {
     packages: recommendedPackages,
@@ -99,6 +101,7 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
     if (naturalLanguageRequest) {
       input.natural_language_request = naturalLanguageRequest;
     }
+    input.trend_mix = { hot: trendMixHot, steady: 100 - trendMixHot };
 
     onSubmit(input);
   };
@@ -346,6 +349,14 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
               />
             </FormField>
           </ColumnLayout>
+        </Container>
+
+        {/* Trend Mix */}
+        <Container header={<Header variant="h2">트렌드 배합</Header>}>
+          <TrendMixSlider
+            value={trendMixHot}
+            onChange={setTrendMixHot}
+          />
         </Container>
 
         {/* Additional requests */}

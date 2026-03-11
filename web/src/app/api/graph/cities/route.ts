@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import gremlin from "gremlin";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { CityNode } from "@/lib/types";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -8,18 +9,22 @@ const asc = (gremlin.process as any).order.asc;
 
 /**
  * GET /api/graph/cities
- * List cities, with optional region filter.
+ * List cities, with optional region filter. Cached for 1h.
  *
  * Query params:
  *   region  - filter by region (e.g., "규슈", "오사카")
  *   country - filter by country (e.g., "일본", "태국")
  */
 export async function GET(request: NextRequest) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const region = searchParams.get("region");
-    const country = searchParams.get("country");
+  const { searchParams } = new URL(request.url);
+  const region = searchParams.get("region");
+  const country = searchParams.get("country");
 
+  const cacheKey = `cities:${region || ""}:${country || ""}`;
+  const cached = cacheGet<CityNode[]>(cacheKey);
+  if (cached) return NextResponse.json(cached);
+
+  try {
     const g = await getTraversal();
     let traversal = g.V().hasLabel("City");
 
@@ -48,6 +53,7 @@ export async function GET(request: NextRequest) {
       };
     });
 
+    cacheSet(cacheKey, cities, TTL.STATIC);
     return NextResponse.json(cities);
   } catch (error) {
     console.error("[/api/graph/cities] Error:", error);

@@ -60,7 +60,7 @@ CONVERSATIONAL_SYSTEM_PROMPT = """당신은 여행 상품 기획을 도와주는
 
 이 경우, 응답 텍스트 맨 마지막에 아래 JSON 마커를 **반드시** 포함하세요:
 ```
-<!--PLANNING_TRIGGER:{"destination":"...", "duration":{"nights":N,"days":N}, "departure_season":"...", "similarity_level":N, "reference_product_id":"...", "themes":[...], "input_mode":"form"}-->
+<!--PLANNING_TRIGGER:{"destination":"...", "duration":{"nights":N,"days":N}, "departure_season":"...", "similarity_level":N, "reference_product_id":"...", "themes":[...], "trend_mix":{"hot":N,"steady":N}, "input_mode":"form"}-->
 ```
 
 마커의 각 필드:
@@ -72,6 +72,7 @@ CONVERSATIONAL_SYSTEM_PROMPT = """당신은 여행 상품 기획을 도와주는
 - `themes`: 테마 목록. 예: ["가족여행"], ["미식","벚꽃"].
 - `input_mode`: 항상 "form".
 - 기타 선택 필드: `max_budget_per_person`, `max_shopping_count`, `hotel_grade`, `target_customer`
+- `trend_mix`: 트렌드 배합 비율. "핫한 것 위주" → {"hot":90,"steady":10}, 미지정 → 생략.
 
 **중요**: 마커 앞에 사용자에게 "기획을 시작하겠습니다" 등의 안내 메시지를 포함하세요.
 

@@ -6,10 +6,19 @@ import FormField from "@cloudscape-design/components/form-field";
 import Autosuggest from "@cloudscape-design/components/autosuggest";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Box from "@cloudscape-design/components/box";
-import ForceGraph from "./ForceGraph";
+import Select from "@cloudscape-design/components/select";
+import CytoscapeGraph from "./CytoscapeGraph";
+import type { LayoutName } from "./CytoscapeGraph";
 import NodeDetailPanel from "./NodeDetailPanel";
 import GraphLegend from "./GraphLegend";
 import type { GraphData, GraphNode } from "@/lib/types";
+
+const LAYOUT_OPTIONS = [
+  { value: "concentric", label: "동심원 (concentric)" },
+  { value: "breadthfirst", label: "계층형 (breadthfirst)" },
+  { value: "cose", label: "Force-Directed (cose)" },
+  { value: "circle", label: "원형 (circle)" },
+];
 
 export default function PackageSubgraph() {
   const [code, setCode] = useState("");
@@ -18,8 +27,10 @@ export default function PackageSubgraph() {
   const [error, setError] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [suggestions, setSuggestions] = useState<{ value: string }[]>([]);
+  const [layout, setLayout] = useState<LayoutName>("concentric");
+  const [rootNodeId, setRootNodeId] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 500 });
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
 
   useEffect(() => {
     const el = containerRef.current;
@@ -30,7 +41,7 @@ export default function PackageSubgraph() {
       if (entry) {
         setDimensions({
           width: entry.contentRect.width,
-          height: Math.max(entry.contentRect.height, 500),
+          height: Math.max(entry.contentRect.height, 600),
         });
       }
     });
@@ -77,6 +88,9 @@ export default function PackageSubgraph() {
       }
       const graphData: GraphData = await res.json();
       setData(graphData);
+      // Find the Package node as root
+      const pkgNode = graphData.nodes.find((n) => n.type === "Package");
+      setRootNodeId(pkgNode?.id || null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "오류가 발생했습니다.");
       setData(null);
@@ -87,24 +101,51 @@ export default function PackageSubgraph() {
 
   return (
     <SpaceBetween size="m">
-      <FormField label="패키지 코드">
-        <Autosuggest
-          value={code}
-          onChange={({ detail }) => setCode(detail.value)}
-          onSelect={({ detail }) => {
-            setCode(detail.value);
-            loadSubgraph(detail.value);
-          }}
-          onLoadItems={({ detail }) => fetchSuggestions(detail.filteringText)}
-          options={suggestions}
-          placeholder="패키지 코드 입력 (예: AVP231260401OZC)"
-          enteredTextLabel={(value) => `"${value}" 검색`}
-          onKeyDown={(e) => {
-            if (e.detail.key === "Enter") loadSubgraph(code);
-          }}
-          empty="결과 없음"
-        />
-      </FormField>
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "flex-end",
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 260 }}>
+          <FormField label="패키지 코드">
+            <Autosuggest
+              value={code}
+              onChange={({ detail }) => setCode(detail.value)}
+              onSelect={({ detail }) => {
+                setCode(detail.value);
+                loadSubgraph(detail.value);
+              }}
+              onLoadItems={({ detail }) =>
+                fetchSuggestions(detail.filteringText)
+              }
+              options={suggestions}
+              placeholder="패키지 코드 입력 (예: AVP231260401OZC)"
+              enteredTextLabel={(value) => `"${value}" 검색`}
+              onKeyDown={(e) => {
+                if (e.detail.key === "Enter") loadSubgraph(code);
+              }}
+              empty="결과 없음"
+            />
+          </FormField>
+        </div>
+        <div style={{ minWidth: 200 }}>
+          <FormField label="레이아웃">
+            <Select
+              selectedOption={
+                LAYOUT_OPTIONS.find((o) => o.value === layout) ||
+                LAYOUT_OPTIONS[0]
+              }
+              onChange={({ detail }) =>
+                setLayout(detail.selectedOption.value as LayoutName)
+              }
+              options={LAYOUT_OPTIONS}
+            />
+          </FormField>
+        </div>
+      </div>
 
       {loading && <StatusIndicator type="loading">로딩 중...</StatusIndicator>}
       {error && <StatusIndicator type="error">{error}</StatusIndicator>}
@@ -115,14 +156,19 @@ export default function PackageSubgraph() {
             노드 {data.nodes.length}개 / 엣지 {data.links.length}개
           </Box>
           <GraphLegend types={Object.keys(data.stats)} />
-          <div ref={containerRef} style={{ position: "relative", width: "100%", height: 500 }}>
-            <ForceGraph
+          <div
+            ref={containerRef}
+            style={{ position: "relative", width: "100%", height: 600 }}
+          >
+            <CytoscapeGraph
               nodes={data.nodes}
               links={data.links}
               width={dimensions.width}
               height={dimensions.height}
+              layout={layout}
               onNodeClick={setSelectedNode}
               selectedNodeId={selectedNode?.id}
+              rootNodeId={rootNodeId}
             />
             <NodeDetailPanel
               node={selectedNode}

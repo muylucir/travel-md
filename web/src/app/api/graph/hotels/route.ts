@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { HotelNode } from "@/lib/types";
 
 /**
@@ -24,6 +25,10 @@ export async function GET(request: NextRequest) {
         { status: 400 }
       );
     }
+
+    const cacheKey = `hotels:${city}:${grade || ""}:${hasOnsen || ""}`;
+    const cached = cacheGet<HotelNode[]>(cacheKey);
+    if (cached) return NextResponse.json(cached);
 
     const g = await getTraversal();
     let traversal = g
@@ -63,6 +68,7 @@ export async function GET(request: NextRequest) {
       };
     });
 
+    cacheSet(cacheKey, hotels, TTL.STATIC);
     return NextResponse.json(hotels);
   } catch (error) {
     console.error("[/api/graph/hotels] Error:", error);

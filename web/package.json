@@ -17,17 +17,21 @@
     "@cloudscape-design/collection-hooks": "^1.0.0",
     "@cloudscape-design/components": "^3.0.0",
     "@cloudscape-design/global-styles": "^1.0.0",
+    "cytoscape": "^3.33.1",
     "gremlin": "^3.7.0",
     "gremlin-aws-sigv4": "^3.6.1",
+    "ioredis": "^5.10.0",
     "next": "latest",
     "react": "^19.0.0",
+    "react-cytoscapejs": "^2.0.0",
     "react-dom": "^19.0.0",
-    "react-force-graph-2d": "^1.27.4",
     "recharts": "^3.7.0"
   },
   "devDependencies": {
+    "@types/cytoscape": "^3.21.9",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
+    "@types/react-cytoscapejs": "^1.2.6",
     "@types/react-dom": "^19.0.0",
     "typescript": "^5.7.0"
   }

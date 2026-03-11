@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { RouteNode } from "@/lib/types";
 
 /**
@@ -13,6 +14,10 @@ export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const region = searchParams.get("region");
+
+    const cacheKey = `routes:${region || ""}`;
+    const cached = cacheGet<RouteNode[]>(cacheKey);
+    if (cached) return NextResponse.json(cached);
 
     const g = await getTraversal();
 
@@ -52,6 +57,7 @@ export async function GET(request: NextRequest) {
       };
     });
 
+    cacheSet(cacheKey, routes, TTL.STATIC);
     return NextResponse.json(routes);
   } catch (error) {
     console.error("[/api/graph/routes] Error:", error);

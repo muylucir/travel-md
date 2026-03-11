@@ -26,6 +26,7 @@ const STATUS_TYPE: Record<
 > = {
   hot: "success",
   steady: "info",
+  seasonal: "warning",
   emerging: "warning",
   stale: "stopped",
 };

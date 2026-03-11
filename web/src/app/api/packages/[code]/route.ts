@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 
 /**
  * GET /api/packages/[code]
@@ -12,6 +13,11 @@ export async function GET(
 ) {
   try {
     const { code } = await params;
+
+    const cacheKey = `pkg-detail:${code}`;
+    const cached = cacheGet<Record<string, unknown>>(cacheKey);
+    if (cached) return NextResponse.json(cached);
+
     const g = await getTraversal();
 
     // Fetch package node
@@ -108,14 +114,9 @@ export async function GET(
       mapToObject(r as Map<string, unknown>)
     );
 
-    return NextResponse.json({
-      package: pkg,
-      cities,
-      attractions,
-      hotels,
-      routes,
-      themes,
-    });
+    const result = { package: pkg, cities, attractions, hotels, routes, themes };
+    cacheSet(cacheKey, result, TTL.SEMI_STATIC);
+    return NextResponse.json(result);
   } catch (error) {
     console.error("[/api/packages/[code]] Error:", error);
     return NextResponse.json(

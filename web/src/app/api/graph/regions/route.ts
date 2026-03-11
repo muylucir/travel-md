@@ -1,11 +1,17 @@
 import { NextResponse } from "next/server";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
+
+const CACHE_KEY = "regions";
 
 /**
  * GET /api/graph/regions
- * Returns all Region nodes from Neptune.
+ * Returns all Region nodes from Neptune. Cached for 1h.
  */
 export async function GET() {
+  const cached = cacheGet<Array<{ name: string }>>(CACHE_KEY);
+  if (cached) return NextResponse.json(cached);
+
   try {
     const g = await getTraversal();
 
@@ -28,6 +34,7 @@ export async function GET() {
       };
     });
 
+    cacheSet(CACHE_KEY, regions, TTL.STATIC);
     return NextResponse.json(regions);
   } catch (error) {
     console.error("[/api/graph/regions] Error:", error);

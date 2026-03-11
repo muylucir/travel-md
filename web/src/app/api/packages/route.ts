@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import gremlin from "gremlin";
 import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { PackageNode } from "@/lib/types";
 
 const __ = gremlin.process.statics;
@@ -23,14 +24,18 @@ const desc = (gremlin.process as any).order.desc;
  *   limit       - max results (default 20)
  */
 export async function GET(request: NextRequest) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const destination = searchParams.get("destination");
-    const theme = searchParams.get("theme");
-    const season = searchParams.get("season");
-    const nights = searchParams.get("nights");
-    const limit = parseInt(searchParams.get("limit") || "100", 10);
+  const { searchParams } = new URL(request.url);
+  const destination = searchParams.get("destination");
+  const theme = searchParams.get("theme");
+  const season = searchParams.get("season");
+  const nights = searchParams.get("nights");
+  const limit = parseInt(searchParams.get("limit") || "100", 10);
 
+  const cacheKey = `packages:${destination || ""}:${theme || ""}:${season || ""}:${nights || ""}:${limit}`;
+  const cached = cacheGet<PackageNode[]>(cacheKey);
+  if (cached) return NextResponse.json(cached);
+
+  try {
     const g = await getTraversal();
 
     let traversal = g.V().hasLabel("Package");
@@ -116,6 +121,7 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    cacheSet(cacheKey, packages, TTL.SEMI_STATIC);
     return NextResponse.json(packages);
   } catch (error) {
     console.error("[/api/packages] Error:", error);

@@ -18,7 +18,7 @@ export default function AppLayout({
 
   return (
     <>
-      <div id="top-nav">
+      <div id="top-nav" style={{ position: "sticky", top: 0, zIndex: 1002 }}>
         <TopNavigation
           identity={{
             href: "/",

@@ -20,6 +20,7 @@ import {
 const STATUS_COLORS: Record<string, string> = {
   hot: "#d13212",
   steady: "#0972d3",
+  seasonal: "#e07941",
   emerging: "#037f0c",
   stale: "#8d9096",
 };
@@ -112,7 +113,7 @@ export default function TrendBubbleChart({ trends }: Props) {
           fontSize: 13,
         }}
       >
-        {(["hot", "steady", "emerging", "stale"] as const).map((s) => (
+        {(["hot", "steady", "seasonal", "emerging", "stale"] as const).map((s) => (
           <span key={s} style={{ display: "flex", alignItems: "center", gap: 4 }}>
             <span
               style={{

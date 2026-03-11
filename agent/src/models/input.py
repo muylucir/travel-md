@@ -54,3 +54,7 @@ class PlanningInput(BaseModel):
         default="form",
         description="Input mode: 'chat' for natural language, 'form' for structured form.",
     )
+    trend_mix: Optional[dict] = Field(
+        default=None,
+        description="Trend tier 배합. 예: {'hot': 70, 'steady': 30}",
+    )

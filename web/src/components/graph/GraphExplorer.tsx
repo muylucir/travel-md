@@ -8,12 +8,22 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
-import ForceGraph from "./ForceGraph";
+import Select from "@cloudscape-design/components/select";
+import CytoscapeGraph from "./CytoscapeGraph";
+import type { LayoutName } from "./CytoscapeGraph";
 import NodeDetailPanel from "./NodeDetailPanel";
 import GraphFilterBar from "./GraphFilterBar";
 import GraphLegend from "./GraphLegend";
 import PackageSubgraph from "./PackageSubgraph";
 import type { GraphData, GraphNode } from "@/lib/types";
+
+const LAYOUT_OPTIONS = [
+  { value: "cose", label: "Force-Directed (cose)" },
+  { value: "concentric", label: "동심원 (concentric)" },
+  { value: "breadthfirst", label: "계층형 (breadthfirst)" },
+  { value: "circle", label: "원형 (circle)" },
+  { value: "grid", label: "그리드 (grid)" },
+];
 
 export default function GraphExplorer() {
   const [activeTab, setActiveTab] = useState("full");
@@ -26,8 +36,9 @@ export default function GraphExplorer() {
   const [error, setError] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [expanding, setExpanding] = useState(false);
+  const [layout, setLayout] = useState<LayoutName>("cose");
   const containerRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 800, height: 500 });
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
 
   useEffect(() => {
     const el = containerRef.current;
@@ -38,7 +49,7 @@ export default function GraphExplorer() {
       if (entry) {
         setDimensions({
           width: entry.contentRect.width,
-          height: Math.max(entry.contentRect.height, 500),
+          height: Math.max(entry.contentRect.height, 600),
         });
       }
     });
@@ -211,6 +222,8 @@ export default function GraphExplorer() {
                       display: "flex",
                       justifyContent: "space-between",
                       alignItems: "center",
+                      gap: 12,
+                      flexWrap: "wrap",
                     }}
                   >
                     <GraphFilterBar
@@ -219,13 +232,35 @@ export default function GraphExplorer() {
                       onTypesChange={setSelectedTypes}
                       stats={fullData?.stats || {}}
                     />
-                    <Button
-                      iconName="refresh"
-                      onClick={() => loadFullGraph()}
-                      loading={loading}
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        alignItems: "center",
+                      }}
                     >
-                      새로고침
-                    </Button>
+                      <div style={{ minWidth: 200 }}>
+                        <Select
+                          selectedOption={
+                            LAYOUT_OPTIONS.find((o) => o.value === layout) ||
+                            LAYOUT_OPTIONS[0]
+                          }
+                          onChange={({ detail }) =>
+                            setLayout(
+                              detail.selectedOption.value as LayoutName
+                            )
+                          }
+                          options={LAYOUT_OPTIONS}
+                        />
+                      </div>
+                      <Button
+                        iconName="refresh"
+                        onClick={() => loadFullGraph()}
+                        loading={loading}
+                      >
+                        새로고침
+                      </Button>
+                    </div>
                   </div>
 
                   {loading && (
@@ -256,14 +291,15 @@ export default function GraphExplorer() {
                         style={{
                           position: "relative",
                           width: "100%",
-                          height: 500,
+                          height: 600,
                         }}
                       >
-                        <ForceGraph
+                        <CytoscapeGraph
                           nodes={filteredData.nodes}
                           links={filteredData.links}
                           width={dimensions.width}
                           height={dimensions.height}
+                          layout={layout}
                           onNodeClick={setSelectedNode}
                           selectedNodeId={selectedNode?.id}
                         />

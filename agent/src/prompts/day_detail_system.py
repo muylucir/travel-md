@@ -60,7 +60,10 @@ DAY_DETAIL_SYSTEM_PROMPT = """당신은 여행 일정의 하루를 상세하게 
 ## 트렌드 삽입 규칙
 - Layer 4 (activity) 또는 Layer 5 (theme) 위치에 자연스럽게 삽입
 - 기존 관광지 근처의 트렌드 스팟 우선
-- effective_score가 높은 트렌드 우선
+- 컨텍스트의 trends 목록은 이미 배합 비율이 적용되어 있으므로 순서대로 우선 삽입
+- hot: 하이라이트/셀링포인트로 강조
+- steady: 안정적 만족도 보장용으로 배치
+- seasonal: 시즌 일치 시에만 삽입
 
 ## 출력 규칙
 - day: 날짜 번호

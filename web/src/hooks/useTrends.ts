@@ -18,6 +18,7 @@ export interface Trend {
   keywords: string[];
   spots: TrendSpot[];
   effective_score: number;
+  tier?: "hot" | "steady" | "seasonal";
   evidence?: TrendEvidence[];
 }
 
@@ -31,9 +32,14 @@ export interface TrendSpot {
   photo_worthy: boolean;
 }
 
-export type TrendStatus = "hot" | "steady" | "emerging" | "stale";
+export type TrendStatus = "hot" | "steady" | "seasonal" | "emerging" | "stale";
 
 export function getTrendStatus(trend: Trend): TrendStatus {
+  // Server-side tier takes priority
+  if (trend.tier === "hot" || trend.tier === "steady" || trend.tier === "seasonal") {
+    return trend.tier;
+  }
+  // Fallback: infer from decay_rate and date
   const now = new Date();
   const trendDate = new Date(trend.date);
   const daysDiff = Math.floor(
@@ -52,6 +58,7 @@ export function getStatusLabel(status: TrendStatus): string {
   const labels: Record<TrendStatus, string> = {
     hot: "핫",
     steady: "스테디",
+    seasonal: "시즌",
     emerging: "신생",
     stale: "갱신필요",
   };
@@ -64,6 +71,7 @@ export function getStatusColor(
   const colors: Record<TrendStatus, "red" | "blue" | "green" | "grey"> = {
     hot: "red",
     steady: "blue",
+    seasonal: "green",
     emerging: "green",
     stale: "grey",
   };
