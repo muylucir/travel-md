@@ -13,6 +13,7 @@
 - **듀얼 인터페이스**: 자연어 챗 모드 + 구조화 폼 모드
 - **트렌드 반영**: 외부 소스(YouTube, Naver, Google Trends, 뉴스)에서 수집한 트렌드를 그래프에 적재하고 상품에 반영
 - **프롬프트 최적화**: Phase별 컨텍스트 필터링 + Bedrock Prompt Caching으로 LLM 입력 토큰 76% 절감
+- **트렌드 Tier 분류**: hot/steady/seasonal Tier 분류 및 배합 비율(trend_mix) 지원
 
 ---
 
@@ -23,7 +24,7 @@
 │                          브라우저 (MD 사용자)                               │
 │    ┌──────────────┐   ┌──────────────┐   ┌──────────┐   ┌───────────────┐   │
 │    │  챗 모드     │   │  폼 모드     │   │ 트렌드   │   │ 그래프 탐색   │   │
-│    │ (자연어 입력)│   │ (드롭다운 등)│   │ 대시보드 │   │ (Force Graph) │   │
+│    │ (자연어 입력)│   │ (드롭다운 등)│   │ 대시보드 │   │ (Cytoscape)   │   │
 │    └──────┬───────┘   └──────┬───────┘   └────┬─────┘   └───────┬───────┘   │
 │           └──────────┬───────┘                │               │             │
 └──────────────────────┼────────────────────────┼───────────────┼─────────────┘
@@ -243,6 +244,29 @@ MCP 도구 호출 결과를 캐싱하여 반복 조회 비용을 절감:
 - Lambda `invalidate_cache` 도구: Gateway MCP를 통해 원격 무효화
 - trend-agent 수집 완료 후 `invalidate_cache(tool_pattern="get_trends")` 자동 호출
 
+#### Frontend Two-Tier Cache
+
+Agent 측 Valkey 캐싱과 별도로, Next.js 프론트엔드에도 2계층 캐시 적용:
+
+| 계층 | 구현 | 범위 | 용량/설정 |
+|------|------|------|----------|
+| **L1: In-memory** | `web/src/lib/api-cache.ts` | per-process | 200 entry cap, per-key TTL |
+| **L2: Valkey** | `web/src/lib/valkey.ts` | 공유 (ElastiCache Serverless) | circuit-breaker (5s→60s backoff) |
+
+**TTL 프리셋**:
+
+| 프리셋 | TTL | 적용 대상 |
+|--------|-----|----------|
+| `GRAPH_STATIC` | 1시간 | 전체 그래프 시각화 (`/api/graph/visualize`) |
+| `GRAPH_SEMI` | 30분 | 이웃 확장 (`visualize/neighbors`), 패키지 서브그래프 (`visualize/package`) |
+| `STATIC` | 1시간 | 정적 Neptune API (cities, hotels, attractions, routes, regions) |
+| `SEMI_STATIC` | 30분 | 준정적 Neptune API (packages) |
+| `TRENDS` | 5분 | 트렌드 관련 API |
+
+- **캐시 키 접두사**: `web:` (프론트엔드) vs `mcp:` (Agent 측) — 키스페이스 분리
+- 그래프 시각화 라우트는 L1 + L2 양계층 적용, 나머지 9개 Neptune API 라우트는 L1 In-memory만 적용
+- L2 Valkey 장애 시 fail-open (L1만으로 서비스 계속)
+
 #### OpenTelemetry 메트릭
 
 - `cache_hit_total`, `cache_miss_total` (Counter, tool_name attribute)
@@ -342,7 +366,7 @@ Phase별 컨텍스트 필터링 + Bedrock Prompt Caching으로 토큰 비용 76%
 | `Route` | (항공 노선 데이터) | 항공 노선 (출발-도착) |
 | `Theme` | name | 여행 테마 (온천, 미식, 역사 등) |
 | `Activity` | (활동 데이터) | 액티비티 |
-| `Trend` | title, type, source, date, virality_score, decay_rate, keywords(JSON), evidence(JSON) | 트렌드 정보 |
+| `Trend` | title, type, source, date, virality_score, decay_rate, tier, keywords(JSON), evidence(JSON) | 트렌드 정보 (tier: hot/steady/seasonal) |
 | `TrendSpot` | name, description, category, lat, lng, photo_worthy | 트렌드 관련 장소 |
 
 #### 간선 (Edge) 레이블
@@ -383,6 +407,7 @@ PlanningInput                        SkeletonOutput (Phase 1)
 ├── similarity_level (0-100)          ├── hotels[]
 ├── reference_product_id              ├── pricing
 ├── themes[]                          └── inclusions/exclusions
+├── trend_mix (Optional[dict])         {"hot": 70, "steady": 30}
 ├── target_customer
 ├── max_budget_per_person             DayDetailOutput (Phase 2)
 ├── max_shopping_count                ├── day_number
@@ -447,7 +472,7 @@ PlanningInput                        SkeletonOutput (Phase 1)
 | `get_routes_by_region` | region | 항공 노선 목록 | Route→TO→City 순회 |
 | `get_attractions_by_city` | city, category? | 관광지 목록 | City→HAS_ATTRACTION |
 | `get_hotels_by_city` | city, grade?, has_onsen? | 호텔 목록 | City→HAS_HOTEL |
-| `get_trends` | region, min_score? | 트렌드 + 스팟 (시간 감쇠 점수) | 유효 점수 = virality × (1-decay)^months |
+| `get_trends` | region, min_score? | 트렌드 + 스팟 (시간 감쇠 점수, tier 포함) | 유효 점수 = virality × (1-decay)^months |
 | `get_similar_packages` | package_code | 유사 패키지 목록 | SIMILAR_TO 간선 순회 |
 | `get_nearby_cities` | city, max_km? | 인접 도시 목록 | NEAR 간선, 거리순 |
 | `get_cities_by_country` | country | 도시 목록 | Country→HAS_CITY |
@@ -456,7 +481,7 @@ PlanningInput                        SkeletonOutput (Phase 1)
 
 | 도구 | 입력 | 설명 |
 |------|------|------|
-| `upsert_trend` | title, type, source, date, virality_score, decay_rate, keywords?, evidence? | 트렌드 Upsert (fold/coalesce, 멱등) |
+| `upsert_trend` | title, type, source, date, virality_score, decay_rate, tier?, keywords?, evidence? | 트렌드 Upsert (fold/coalesce, 멱등) |
 | `upsert_trend_spot` | name, description?, category?, lat?, lng?, photo_worthy? | 트렌드 스팟 Upsert |
 | `link_trend_to_spot` | trend_title, trend_source, spot_name, edge_label?, city_name? | 트렌드↔스팟↔도시 연결 |
 
@@ -492,7 +517,7 @@ PlanningInput                        SkeletonOutput (Phase 1)
 
 - **프레임워크**: Next.js (App Router) + React 19 + TypeScript 5.7
 - **디자인 시스템**: AWS Cloudscape Design System v3
-- **그래프 시각화**: react-force-graph-2d (Force-directed graph)
+- **그래프 시각화**: Cytoscape (react-cytoscapejs) — 5가지 레이아웃 (cose, concentric, breadthfirst, circle, grid)
 - **차트**: Recharts (트렌드 버블 차트)
 - **상태 관리**: 커스텀 훅 (전역 상태 없음, 페이지별 독립)
 
@@ -501,7 +526,7 @@ PlanningInput                        SkeletonOutput (Phase 1)
 | 경로 | 컴포넌트 | 기능 |
 |------|---------|------|
 | `/planning` | `PlanningPage` | 상품 기획 (챗 모드 / 폼 모드 탭 전환) |
-| `/products` | `ProductTable` | AI 생성 상품 목록 (DynamoDB) |
+| `/products` | `ProductTable` | AI 생성 상품 목록 (DynamoDB, 10건/페이지 페이지네이션, YYYY-MM-DD HH:mm 날짜 형식) |
 | `/products/[code]` | `ProductDetail` → `ResultPanel` | 상품 상세 조회 |
 | `/packages` | `PackageTable` → `PackageDetail` | 기존 패키지 브라우징 (Neptune) |
 | `/trends` | `TrendDashboard` | 트렌드 대시보드 (요약/버블차트/테이블/수집) |
@@ -513,7 +538,8 @@ PlanningInput                        SkeletonOutput (Phase 1)
 PlanningPage
 ├── ChatMode            ← 자연어 대화 (스트리밍, 도구 사용 표시, 기획 트리거)
 ├── FormMode            ← 13개 입력 필드 (지역/기간/시즌/테마/유사도 등)
-│   └── SimilaritySlider ← 5-Layer 시각적 표시 + 0-100% 슬라이더
+│   ├── SimilaritySlider ← 5-Layer 시각적 표시 + 0-100% 슬라이더
+│   └── TrendMixSlider   ← 트렌드 배합 비율 (핫:스테디) 슬라이더
 ├── ProgressBar         ← 4단계 진행률 (파싱→컨텍스트→생성→검증)
 └── ResultPanel         ← 8개 섹션 (요약/가격/항공/일정/관광지/호텔/포함사항/변경이력)
     └── ItineraryCard   ← 일별 일정 카드
@@ -523,11 +549,11 @@ TrendDashboard
 └── TrendTable          ← 페이지네이션 테이블 + 확장형 Evidence 패널
 
 GraphExplorer
-├── ForceGraph          ← react-force-graph-2d (10가지 노드 타입 색상 구분)
-├── GraphFilterBar      ← 노드 타입 멀티셀렉트 필터
-├── GraphLegend         ← 색상 범례
-├── NodeDetailPanel     ← 선택 노드 속성 표시
-└── PackageSubgraph     ← 패키지 코드로 1-hop 서브그래프 조회
+├── CytoscapeGraph    ← Cytoscape.js (5가지 레이아웃, 호버 하이라이트, 줌 엣지 라벨)
+├── GraphFilterBar    ← 노드 타입 멀티셀렉트 필터
+├── GraphLegend       ← 색상 범례
+├── NodeDetailPanel   ← 선택 노드 속성 + 이웃 확장
+└── PackageSubgraph   ← 패키지 서브그래프 (동심원/계층형 레이아웃)
 ```
 
 ### 6.4 데이터 흐름
@@ -692,24 +718,24 @@ travel-md/
         │   ├── packages/page.tsx
         │   ├── trends/page.tsx
         │   ├── graph/page.tsx
-        │   └── api/                  # 11개 API 엔드포인트
+        │   └── api/                  # API 엔드포인트
         │       ├── planning/route.ts
         │       ├── products/route.ts
         │       ├── products/[code]/route.ts
         │       ├── packages/route.ts
         │       ├── packages/[code]/route.ts
         │       ├── trends/collect/route.ts
-        │       └── graph/{cities,attractions,hotels,routes,regions,trends,visualize}/
+        │       └── graph/{cities,attractions,hotels,routes,regions,trends,visualize,visualize/neighbors,visualize/package}/
         ├── components/
         │   ├── layout/               # AppLayout, Navigation
         │   ├── planning/             # PlanningPage, FormMode, ChatMode, ResultPanel, ...
-        │   ├── common/               # SimilaritySlider, ThemeMultiselect
+        │   ├── common/               # SimilaritySlider, ThemeMultiselect, TrendMixSlider
         │   ├── packages/             # PackageTable, PackageDetail
         │   ├── products/             # ProductTable, ProductDetail
         │   ├── trends/               # TrendDashboard, TrendBubbleChart, TrendTable
-        │   └── graph/                # GraphExplorer, ForceGraph, NodeDetailPanel, ...
+        │   └── graph/                # GraphExplorer, CytoscapeGraph, NodeDetailPanel, ...
         ├── hooks/                    # usePlanning, useChat, usePackages, useProducts, useTrends, useTrendCollector
-        └── lib/                      # agentcore.ts, sse-client.ts, dynamodb.ts, gremlin.ts, types.ts
+        └── lib/                      # agentcore.ts, sse-client.ts, dynamodb.ts, gremlin.ts, api-cache.ts, valkey.ts, types.ts
 ```
 
 ---
