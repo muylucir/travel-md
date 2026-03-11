@@ -1,0 +1,21 @@
+{
+  "name": "ota-travel-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy --all",
+    "deploy:lambda": "cdk deploy OtaTravelLambdaStack",
+    "deploy:web": "cdk deploy OtaTravelWebStack",
+    "destroy": "cdk destroy --all"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "aws-cdk-lib": "^2.241.0",
+    "constructs": "^10.4.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.7.0"
+  }
+}
