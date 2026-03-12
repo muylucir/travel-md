@@ -248,7 +248,6 @@ NAVER_CLIENT_SECRET=...
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 전체 아키텍처, 데이터 모델, 시퀀스 다이어그램 |
 | [why-graphrag.md](docs/why-graphrag.md) | GraphRAG 도입 근거 |
 | [cost-estimation.md](docs/cost-estimation.md) | 월간 비용 추정 |
-| [security-audit](docs/security-audit-2026-03-11.md) | 보안 감사 보고서 |
 
 ---
 
