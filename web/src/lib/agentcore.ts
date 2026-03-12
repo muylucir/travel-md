@@ -12,9 +12,7 @@ import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { HttpRequest } from "@smithy/protocol-http";
 
 const REGION = process.env.AWS_REGION || "ap-northeast-2";
-const AGENT_ARN =
-  process.env.AGENTCORE_AGENT_ARN ||
-  "arn:aws:bedrock-agentcore:ap-northeast-2:REDACTED_ACCOUNT_ID:runtime/REDACTED_TRAVEL_AGENT_ID";
+const AGENT_ARN = process.env.AGENTCORE_AGENT_ARN || "";
 const TREND_COLLECTOR_AGENT_ARN =
   process.env.TREND_COLLECTOR_AGENT_ARN || "";
 

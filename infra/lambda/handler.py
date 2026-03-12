@@ -44,7 +44,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 TOOL_REGISTRY = {
-    # Graph tools (8)
+    # Graph tools (9)
     "get_package": get_package,
     "search_packages": search_packages,
     "get_routes_by_region": get_routes_by_region,

@@ -40,3 +40,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# CDK context cache (contains account ID)
+infra/cdk/cdk.context.json
+
+# AgentCore CLI auto-generated config (contains account ID, ARNs)
+**/.bedrock_agentcore.yaml

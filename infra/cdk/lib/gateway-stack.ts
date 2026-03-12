@@ -55,7 +55,7 @@ export class OtaGatewayStack extends cdk.Stack {
     });
 
     // ════════════════════════════════════════════════════════════
-    //  3. CfnGatewayTarget — travel-tools (16 tools)
+    //  3. CfnGatewayTarget — travel-tools (17 tools)
     // ════════════════════════════════════════════════════════════
 
     const travelToolSchemas = loadToolSchemas(

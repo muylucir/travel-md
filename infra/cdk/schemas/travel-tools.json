@@ -95,7 +95,7 @@
   },
   {
     "name": "get_trends",
-    "description": "Retrieve active trends and TrendSpot locations for a region with time-decay scoring.",
+    "description": "Retrieve active trends and TrendSpot locations for a region, country, or city with time-decay scoring.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -103,11 +103,20 @@
           "type": "string",
           "description": "Region name."
         },
+        "country": {
+          "type": "string",
+          "description": "Country name."
+        },
+        "city": {
+          "type": "string",
+          "description": "City name."
+        },
         "min_score": {
-          "type": "integer"
+          "type": "integer",
+          "description": "Minimum virality score (default 30)."
         }
       },
-      "required": ["region"]
+      "required": []
     }
   },
   {
@@ -139,6 +148,20 @@
         }
       },
       "required": ["city"]
+    }
+  },
+  {
+    "name": "get_cities_by_country",
+    "description": "Get all cities for a country from the Knowledge Graph.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "country": {
+          "type": "string",
+          "description": "Country name."
+        }
+      },
+      "required": ["country"]
     }
   },
   {
@@ -227,12 +250,41 @@
           "type": "number",
           "description": "Decay rate 0.0-1.0."
         },
+        "tier": {
+          "type": "string",
+          "description": "Trend tier (e.g. hot, warm, emerging)."
+        },
         "keywords": {
           "type": "array",
           "items": {
             "type": "string"
           },
           "description": "Related keywords."
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "source": {
+                "type": "string",
+                "description": "Evidence source (e.g. youtube, naver, news)."
+              },
+              "title": {
+                "type": "string",
+                "description": "Evidence title."
+              },
+              "url": {
+                "type": "string",
+                "description": "Evidence URL."
+              },
+              "metric": {
+                "type": "string",
+                "description": "Metric info (e.g. views: 1.2M)."
+              }
+            }
+          },
+          "description": "List of evidence items supporting this trend."
         }
       },
       "required": ["title", "type", "source", "date", "virality_score", "decay_rate"]
