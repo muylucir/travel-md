@@ -54,6 +54,16 @@ export class DataStack extends cdk.Stack {
       // snapshotIdentifier: 'travel-cdk-migration', // uncomment for initial migration
     });
 
+    // Neptune Serverless still requires at least one CfnDBInstance
+    // with db.serverless class — without it the cluster endpoint DNS
+    // won't resolve (NXDOMAIN).
+    const instance = new neptune.CfnDBInstance(this, "NeptuneInstance", {
+      dbClusterIdentifier: cluster.ref,
+      dbInstanceClass: "db.serverless",
+      dbInstanceIdentifier: `${CONFIG.neptune.clusterIdentifier}-instance-1`,
+    });
+    instance.addDependency(cluster);
+
     this.neptuneEndpoint = `wss://${cluster.attrEndpoint}:${CONFIG.neptune.port}/gremlin`;
     this.neptuneHost = cluster.attrEndpoint;
 
@@ -69,7 +79,7 @@ export class DataStack extends cdk.Stack {
         serverlessCacheName: CONFIG.valkey.cacheName,
         majorEngineVersion: CONFIG.valkey.majorEngineVersion,
         securityGroupIds: [props.valkeySg.securityGroupId],
-        subnetIds: privateSubnets.subnetIds,
+        subnetIds: privateSubnets.subnetIds.slice(0, 3),
         snapshotRetentionLimit: 0,
       }
     );

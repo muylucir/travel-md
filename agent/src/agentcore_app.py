@@ -17,11 +17,8 @@ import time
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
-from src.agents.conversational import create_conversational_agent
-from src.models.input import PlanningInput
-from src.models.output import PlanningOutput
-from src.orchestrator.graph import create_planning_graph
-from src.mcp_connection import get_mcp_client, prefixed
+# Heavy imports (strands, bedrock, mcp, pydantic) are deferred to first
+# invocation so that AgentCore Runtime initialization completes within 30s.
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +33,7 @@ _conversational_agent = None
 def _get_graph():
     global _graph
     if _graph is None:
+        from src.orchestrator.graph import create_planning_graph
         _graph = create_planning_graph()
     return _graph
 
@@ -43,6 +41,7 @@ def _get_graph():
 def _get_conversational_agent():
     global _conversational_agent
     if _conversational_agent is None:
+        from src.agents.conversational import create_conversational_agent
         _conversational_agent = create_conversational_agent()
     return _conversational_agent
 
@@ -196,6 +195,7 @@ async def _handle_planning(payload):
 
         yield {"event": "progress", "data": {"step": "입력 파싱 중...", "percent": 5}}
 
+        from src.models.input import PlanningInput
         planning_input = PlanningInput(**input_data)
 
         invocation_state = {
@@ -256,6 +256,7 @@ async def _handle_planning(payload):
 
         planning_output_data = invocation_state.get("planning_output")
 
+        from src.models.output import PlanningOutput
         if planning_output_data and isinstance(planning_output_data, dict) and len(planning_output_data) > 0:
             output = PlanningOutput(**planning_output_data)
         else:
@@ -304,6 +305,7 @@ async def _handle_planning(payload):
         yield {"event": "progress", "data": {"step": "상품 저장 중...", "percent": 90}}
         saved_code = None
         try:
+            from src.mcp_connection import get_mcp_client, prefixed
             product_json = output.model_dump_json()
             mcp = get_mcp_client()
             save_result = mcp.call_tool_sync(

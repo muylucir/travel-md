@@ -36,7 +36,7 @@ export class NetworkStack extends cdk.Stack {
       vpc: this.vpc,
       securityGroupName: "ota-neptune-sg",
       description:
-        "Neptune, Lambda, AgentCore — self-referencing on port 8182",
+        "Neptune, Lambda, AgentCore - self-referencing on port 8182",
       allowAllOutbound: true,
     });
 
@@ -50,7 +50,7 @@ export class NetworkStack extends cdk.Stack {
     this.valkeySg = new ec2.SecurityGroup(this, "ValkeySg", {
       vpc: this.vpc,
       securityGroupName: "ota-valkey-sg",
-      description: "Valkey — allow port 6379 from Neptune SG members",
+      description: "Valkey - allow port 6379 from Neptune SG members",
       allowAllOutbound: true,
     });
 
