@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REGION="ap-northeast-2"
-STACK_NAME="OtaTravelWebStack"
+STACK_NAME="OtaWebStack"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WEB_DIR="$(cd "$SCRIPT_DIR/../../web" && pwd)"
 

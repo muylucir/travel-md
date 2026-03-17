@@ -113,6 +113,17 @@ export class WebHostingStack extends cdk.Stack {
     // Attach Neptune SG — gives access to Neptune (8182) + Valkey (6379)
     instance.addSecurityGroup(props.neptuneSg);
 
+    // Allow CloudFront VPC Origin → EC2 on port 3000
+    // VPC Origins require the CloudFront managed prefix list, not VPC CIDR.
+    const cfPrefixList = ec2.PrefixList.fromLookup(this, "CloudFrontPL", {
+      prefixListName: "com.amazonaws.global.cloudfront.origin-facing",
+    });
+    instance.connections.allowFrom(
+      ec2.Peer.prefixList(cfPrefixList.prefixListId),
+      ec2.Port.tcp(APP_PORT),
+      "CloudFront VPC Origin to Next.js"
+    );
+
     // ── 4. UserData — bootstrap Node.js + systemd service ──────
     instance.addUserData(
       "#!/bin/bash",
@@ -162,7 +173,20 @@ export class WebHostingStack extends cdk.Stack {
       "SVCEOF",
       "",
       "systemctl daemon-reload",
-      "systemctl enable nextjs"
+      "systemctl enable nextjs",
+      "",
+      "# Pull latest build from S3 and start service",
+      `DEPLOY_BUCKET="${deployBucket.bucketName}"`,
+      "APP_DIR=/opt/travel-md-web",
+      "",
+      "if aws s3 ls \"s3://${DEPLOY_BUCKET}/latest.tar.gz\" 2>/dev/null; then",
+      "  aws s3 cp \"s3://${DEPLOY_BUCKET}/latest.tar.gz\" /tmp/app.tar.gz",
+      "  rm -rf ${APP_DIR}/server.js ${APP_DIR}/node_modules ${APP_DIR}/.next ${APP_DIR}/public",
+      "  tar -xzf /tmp/app.tar.gz -C ${APP_DIR}",
+      "  chown -R ec2-user:ec2-user ${APP_DIR}",
+      "  rm -f /tmp/app.tar.gz",
+      "  systemctl start nextjs",
+      "fi"
     );
 
     // ── 5. CloudFront Distribution ─────────────────────────────
