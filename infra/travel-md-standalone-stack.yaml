@@ -1332,7 +1332,7 @@ Resources:
             - !Ref PrivateSubnet1
             - !Ref PrivateSubnet2
       EnvironmentVariables:
-        GATEWAY_MCP_URL: !Join ['', [!GetAtt OtaGateway.GatewayUrl, '/mcp']]
+        GATEWAY_MCP_URL: !GetAtt OtaGateway.GatewayUrl
         BEDROCK_REGION: us-east-1
         REDIS_HOST: !GetAtt ValkeyCache.Endpoint.Address
         GREMLIN_ENDPOINT: !Join ['', ['wss://', !GetAtt NeptuneCluster.Endpoint, ':8182/gremlin']]
@@ -1362,7 +1362,7 @@ Resources:
       NetworkConfiguration:
         NetworkMode: PUBLIC
       EnvironmentVariables:
-        GATEWAY_MCP_URL: !Join ['', [!GetAtt OtaGateway.GatewayUrl, '/mcp']]
+        GATEWAY_MCP_URL: !GetAtt OtaGateway.GatewayUrl
         BEDROCK_REGION: us-east-1
         AWS_DEFAULT_REGION: !Ref 'AWS::Region'
 
@@ -1453,7 +1453,7 @@ Outputs:
 
   GatewayUrl:
     Description: AgentCore Gateway MCP URL
-    Value: !Join ['', [!GetAtt OtaGateway.GatewayUrl, '/mcp']]
+    Value: !GetAtt OtaGateway.GatewayUrl
 
   GatewayArn:
     Description: AgentCore Gateway ARN
