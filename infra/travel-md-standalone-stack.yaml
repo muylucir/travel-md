@@ -1,0 +1,1484 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'OTA Travel MD - Standalone Stack (GraphRAG + AgentCore + Next.js)'
+
+Mappings:
+  CidrMappings:
+    public-subnet-1: {CIDR: 10.3.1.0/24}
+    private-subnet-1: {CIDR: 10.3.2.0/24}
+    private-subnet-2: {CIDR: 10.3.3.0/24}
+    vpc: {CIDR: 10.3.0.0/16}
+  DomainNameMappings:
+    us-east-1: {Domain: ec2.internal}
+    ap-northeast-1: {Domain: ap-northeast-1.compute.internal}
+    ap-northeast-2: {Domain: ap-northeast-2.compute.internal}
+  AWSRegionsPrefixListID:
+    us-east-1: {PrefixList: pl-3b927c52}
+    ap-northeast-1: {PrefixList: pl-58a04531}
+    ap-northeast-2: {PrefixList: pl-22a6434b}
+
+Resources:
+  # ============================================================
+  # VPC & Networking (2 AZ — Neptune requires multi-AZ subnet group)
+  # ============================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [CidrMappings, vpc, CIDR]
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-VPC'}
+
+  DHCPOptions:
+    Type: AWS::EC2::DHCPOptions
+    Properties:
+      DomainName: !FindInMap [DomainNameMappings, !Ref 'AWS::Region', Domain]
+      DomainNameServers: [AmazonProvidedDNS]
+
+  VPCDHCPOptionsAssociation:
+    Type: AWS::EC2::VPCDHCPOptionsAssociation
+    Properties:
+      DhcpOptionsId: !Ref DHCPOptions
+      VpcId: !Ref VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: VPC
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn: [VPC, InternetGateway]
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # NAT Gateway for private subnets (Lambda VPC, AgentCore VPC → AWS APIs)
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-NATGW'}
+
+  # ── Public Route Table ──
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: [VPC, AttachGateway]
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-PublicRT'}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: [PublicRouteTable, AttachGateway]
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Private Route Table ──
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-PrivateRT'}
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── Public Subnet (AZ-a) — EC2, NAT GW ──
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone: !Select ['0', !GetAZs '']
+      CidrBlock: !FindInMap [CidrMappings, public-subnet-1, CIDR]
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-PublicSubnet1'}
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: [PublicRouteTable, PublicSubnet1, AttachGateway]
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  # ── Private Subnet 1 (AZ-a) — Neptune, Valkey, Lambda, AgentCore VPC ──
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select ['0', !GetAZs '']
+      CidrBlock: !FindInMap [CidrMappings, private-subnet-1, CIDR]
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-PrivateSubnet1'}
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  # ── Private Subnet 2 (AZ-b) — Neptune subnet group 2nd AZ ──
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select ['1', !GetAZs '']
+      CidrBlock: !FindInMap [CidrMappings, private-subnet-2, CIDR]
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-PrivateSubnet2'}
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  # Shared SG for Neptune / Valkey / Lambda VPC / AgentCore VPC / EC2
+  # Self-referencing: members can reach Neptune (8182) and Valkey (6379)
+  NeptuneSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} - Neptune/Valkey/Lambda/AgentCore'
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-NeptuneSG'}
+
+  NeptuneSGIngress8182:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NeptuneSG
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      SourceSecurityGroupId: !Ref NeptuneSG
+
+  NeptuneSGIngress6379:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NeptuneSG
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref NeptuneSG
+
+  # CloudFront-only ingress to EC2 on port 3000
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} - Allow CloudFront ingress on port 3000'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Allow HTTP from CloudFront (Next.js port 3000)
+          IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourcePrefixListId: !FindInMap [AWSRegionsPrefixListID, !Ref 'AWS::Region', PrefixList]
+
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+
+  # EC2 Instance Role
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess
+      Policies:
+        - PolicyName: EC2Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${CodeBucket}'
+                  - !Sub 'arn:aws:s3:::${CodeBucket}/*'
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt DynamoTable.Arn
+                  - !Sub '${DynamoTable.Arn}/index/*'
+              - Sid: NeptuneAccess
+                Effect: Allow
+                Action:
+                  - neptune-db:*
+                Resource: '*'
+              - Sid: AgentCoreInvoke
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgent
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # AgentCore Runtime Role (shared by both agents)
+  AgentCoreRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-agentcore-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+
+  AgentCoreRuntimeRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AgentCoreRuntimePolicy
+      Roles:
+        - !Ref AgentCoreRuntimeRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+              - 'arn:aws:bedrock:*::foundation-model/*'
+          - Sid: S3Read
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${CodeBucket}/*'
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+          - Sid: XRay
+            Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+            Resource: '*'
+          - Sid: CloudWatchMetrics
+            Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: '*'
+          - Sid: ECRPull
+            Effect: Allow
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:GetAuthorizationToken
+            Resource: '*'
+          - Sid: GatewayInvoke
+            Effect: Allow
+            Action:
+              - bedrock-agentcore:InvokeGateway
+              - bedrock-agentcore:Invoke
+            Resource: '*'
+          - Sid: Marketplace
+            Effect: Allow
+            Action:
+              - aws-marketplace:ViewSubscriptions
+              - aws-marketplace:Subscribe
+            Resource: '*'
+
+  # Travel Tools Lambda Role (VPC — Neptune + DynamoDB + Valkey)
+  TravelToolsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-travel-tools-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: TravelToolsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: NeptuneAccess
+                Effect: Allow
+                Action:
+                  - neptune-db:*
+                Resource: '*'
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt DynamoTable.Arn
+                  - !Sub '${DynamoTable.Arn}/index/*'
+
+  # Trend Collector Lambda Role (no VPC — needs internet for YouTube/Naver/Google)
+  TrendCollectorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-trend-collector-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Gateway Role (invoke Lambda functions)
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+
+  GatewayRolePolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - TravelToolsLambda
+      - TrendCollectorLambda
+    Properties:
+      PolicyName: GatewayInvokeLambda
+      Roles:
+        - !Ref GatewayRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !GetAtt TravelToolsLambda.Arn
+              - !GetAtt TrendCollectorLambda.Arn
+
+  # ============================================================
+  # S3 Bucket for deployment packages
+  # ============================================================
+
+  CodeBucket:
+    Type: AWS::S3::Bucket
+
+  # ============================================================
+  # Data Layer — Neptune Serverless, Valkey Serverless, DynamoDB
+  # ============================================================
+
+  NeptuneSubnetGroup:
+    Type: AWS::Neptune::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${AWS::StackName} Neptune subnet group'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub '${AWS::StackName}-neptune'
+      EngineVersion: '1.4.1.0'
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref NeptuneSG
+      IamAuthEnabled: true
+      StorageEncrypted: true
+      ServerlessScalingConfiguration:
+        MinCapacity: 2
+        MaxCapacity: 16
+      DeletionProtection: false
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-neptune'}
+
+  NeptuneInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref NeptuneCluster
+      DBInstanceClass: db.serverless
+      Tags:
+        - {Key: Name, Value: !Sub '${AWS::StackName}-neptune-instance'}
+
+  ValkeyCache:
+    Type: AWS::ElastiCache::ServerlessCache
+    Properties:
+      Engine: valkey
+      ServerlessCacheName: !Sub '${AWS::StackName}-valkey'
+      SecurityGroupIds:
+        - !Ref NeptuneSG
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  DynamoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-products'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: product_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: product_code
+          KeyType: HASH
+
+  # ============================================================
+  # EC2 Instance (ARM64 Graviton, m7g.medium, 30GB)
+  # ============================================================
+
+  OtaInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [EC2SecurityGroup, NeptuneSG]
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64}}'
+      InstanceType: m7g.medium
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+        - !Ref NeptuneSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Monitoring: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-Instance'
+
+  # ============================================================
+  # Custom Resource Lambdas: Run / Check SSM Documents
+  # ============================================================
+
+  SSMDocLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMDocOnEC2
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${BuildAllSSMDoc}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${FrontendDeploySSMDoc}'
+                  - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${OtaInstance}'
+              - Effect: Allow
+                Action:
+                  - ssm:ListCommandInvocations
+                  - ssm:GetCommandInvocation
+                Resource: '*'
+
+  RunSSMDocLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Run SSM document on EC2 instance
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      MemorySize: 128
+      Timeout: 600
+      Environment:
+        Variables:
+          RetrySleep: 2900
+          AbortTimeRemaining: 3200
+      Role: !GetAtt SSMDocLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          import time
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              if event['RequestType'] != 'Create':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={}, reason='No action to take')
+              else:
+                  sleep_ms = int(os.environ.get('RetrySleep'))
+                  abort_time_remaining_ms = int(os.environ.get('AbortTimeRemaining'))
+                  resource_properties = event['ResourceProperties']
+                  instance_id = resource_properties['InstanceId']
+                  document_name = resource_properties['DocumentName']
+                  cloudwatch_log_group_name = resource_properties['CloudWatchLogGroupName']
+
+                  logger.info(f'Running SSM Document {document_name} on EC2 instance {instance_id}')
+
+                  del resource_properties['ServiceToken']
+                  if 'ServiceTimeout' in resource_properties:
+                      del resource_properties['ServiceTimeout']
+                  del resource_properties['InstanceId']
+                  del resource_properties['DocumentName']
+                  del resource_properties['CloudWatchLogGroupName']
+
+                  parameters = {}
+                  for key, value in resource_properties.items():
+                      parameters[key] = [value]
+
+                  retry = True
+                  attempt_no = 0
+                  time_remaining_ms = context.get_remaining_time_in_millis()
+                  ssm = boto3.client('ssm')
+
+                  while (retry == True):
+                      attempt_no += 1
+                      logger.info(f'Attempt: {attempt_no}. Time Remaining: {time_remaining_ms/1000}s')
+                      try:
+                          response = ssm.send_command(
+                              InstanceIds = [instance_id],
+                              DocumentName = document_name,
+                              CloudWatchOutputConfig = {'CloudWatchLogGroupName': cloudwatch_log_group_name, 'CloudWatchOutputEnabled': True},
+                              Parameters = parameters
+                          )
+                          command_id = response['Command']['CommandId']
+                          responseData = {'CommandId': command_id}
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, reason='OK')
+                          retry = False
+
+                      except ssm.exceptions.InvalidInstanceId as e:
+                          time_remaining_ms = context.get_remaining_time_in_millis()
+                          if (time_remaining_ms > abort_time_remaining_ms):
+                              logger.info(f'Instance {instance_id} not ready. Sleeping: {sleep_ms/1000}s')
+                              time.sleep(sleep_ms/1000)
+                              retry = True
+                          else:
+                              logger.error(e, exc_info=True)
+                              cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason='Timed out')
+                              retry = False
+                      except Exception as e:
+                          logger.error(e, exc_info=True)
+                          cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason=str(e))
+                          retry = False
+
+  CheckSSMDocLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Check SSM document completion on EC2 instance
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      MemorySize: 128
+      Timeout: 600
+      Environment:
+        Variables:
+          RetrySleep: 2900
+          AbortTimeRemaining: 5000
+      Role: !GetAtt SSMDocLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          import time
+          import os
+          import re
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def sanitize(text):
+              text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+              text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+              return text
+
+          def lambda_handler(event, context):
+              if event['RequestType'] != 'Create':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={}, reason='No action to take')
+              else:
+                  sleep_ms = int(os.environ.get('RetrySleep'))
+                  abort_time_remaining_ms = int(os.environ.get('AbortTimeRemaining'))
+                  resource_properties = event['ResourceProperties']
+                  instance_id = resource_properties['InstanceId']
+                  document_name = resource_properties['DocumentName']
+
+                  logger.info(f'Checking SSM Document {document_name} on EC2 instance {instance_id}')
+
+                  retry = True
+                  attempt_no = 0
+                  time_remaining_ms = context.get_remaining_time_in_millis()
+                  ssm = boto3.client('ssm')
+
+                  while (retry == True):
+                      attempt_no += 1
+                      logger.info(f'Attempt: {attempt_no}. Time Remaining: {time_remaining_ms/1000}s')
+                      try:
+                          response = ssm.list_command_invocations(
+                              InstanceId=instance_id,
+                              Details=True
+                          )
+
+                          for invocation in response['CommandInvocations']:
+                              if invocation['DocumentName'] == document_name:
+                                  invocation_status = invocation['Status']
+                                  if invocation_status == 'Success':
+                                      logger.info(f'SSM Document completed successfully')
+                                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={}, reason='OK')
+                                      retry = False
+                                  elif invocation_status in ['Failed', 'Cancelled', 'TimedOut']:
+                                      reason = f'SSM Document failed with status: {invocation_status}'
+                                      for step in invocation['CommandPlugins']:
+                                          step_name = step['Name']
+                                          step_status = step['Status']
+                                          if step_status != 'Success':
+                                              step_output = step.get('Output', 'No output available')
+                                              clean_output = sanitize(step_output[-2000:])
+                                              reason += f'\nStep {step_name} {step_status}: {clean_output}'
+                                      logger.error(reason)
+                                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason=reason)
+                                      retry = False
+                                  else:
+                                      logger.info(f'SSM Document still running. Status: {invocation_status}')
+                                      retry = True
+
+                          if retry == True:
+                              if (time_remaining_ms > abort_time_remaining_ms):
+                                  time.sleep(sleep_ms/1000)
+                                  time_remaining_ms = context.get_remaining_time_in_millis()
+                              else:
+                                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason='Timeout waiting for SSM document completion')
+                                  retry = False
+                      except Exception as e:
+                          logger.error(e, exc_info=True)
+                          cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason=str(e))
+                          retry = False
+
+  # Health Check Lambda
+  HealthCheckLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  HealthCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Run health check on travel-md frontend
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      MemorySize: 128
+      Timeout: 600
+      Environment:
+        Variables:
+          RetrySleep: 2900
+          AbortTimeRemaining: 5000
+      Role: !GetAtt HealthCheckLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import logging
+          import time
+          import os
+          import http.client
+          from urllib.parse import urlparse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def healthURLOk(url):
+              try:
+                  parsed_url = urlparse(url)
+                  if parsed_url.scheme == 'https':
+                      conn = http.client.HTTPSConnection(parsed_url.netloc)
+                  else:
+                      conn = http.client.HTTPConnection(parsed_url.netloc)
+                  conn.request("GET", parsed_url.path or "/")
+                  response = conn.getresponse()
+                  if 200 <= response.status < 400:
+                      logger.info(f'Health check OK with status code: {response.status}')
+                      return True
+                  else:
+                      logger.info(f'Health check failed with status: {response.status}')
+                      return False
+              except Exception as e:
+                  logger.error(e, exc_info=True)
+                  return False
+              finally:
+                  if 'conn' in locals():
+                      conn.close()
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] != 'Create':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={}, reason='No action to take')
+                  else:
+                      sleep_ms = int(os.environ.get('RetrySleep'))
+                      abort_time_remaining_ms = int(os.environ.get('AbortTimeRemaining'))
+                      url = event['ResourceProperties']['Url']
+
+                      logger.info(f'Testing url: {url}')
+                      time_remaining_ms = context.get_remaining_time_in_millis()
+                      attempt_no = 0
+                      health_check = False
+
+                      while (attempt_no == 0 or (time_remaining_ms > abort_time_remaining_ms and not health_check)):
+                          attempt_no += 1
+                          logger.info(f'Attempt: {attempt_no}. Time Remaining: {time_remaining_ms/1000}s')
+                          health_check = healthURLOk(url)
+                          if not health_check:
+                              time.sleep(sleep_ms/1000)
+                          time_remaining_ms = context.get_remaining_time_in_millis()
+
+                      if health_check:
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={}, reason='Health check successful')
+                      else:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason='Health check failed')
+              except Exception as e:
+                  logger.error(e, exc_info=True)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason=str(e))
+
+  # ============================================================
+  # SSM Document: Build ALL Packages (Lambda + Agent zips)
+  # ============================================================
+
+  BuildAllSSMDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: Build Lambda and Agent deployment packages and upload to S3
+        parameters:
+          S3Bucket:
+            type: String
+        mainSteps:
+          - name: BuildAndUpload
+            action: aws:runShellScript
+            inputs:
+              timeoutSeconds: 1200
+              runCommand:
+                - '#!/bin/bash'
+                - set -e
+                - echo "=== Installing Python 3.11 ==="
+                - dnf install -y -q python3.11 python3.11-pip git
+                - python3.11 --version
+                - echo "=== Cloning travel-md repository ==="
+                - cd /tmp && rm -rf travel-md-build
+                - git clone https://github.com/muylucir/travel-md.git travel-md-build
+                #
+                # ── Lambda: travel-tools ──
+                - echo "=== Building travel-tools Lambda package ==="
+                - cd /tmp/travel-md-build/infra/lambda
+                - PKG=deployment_package
+                - rm -rf $PKG && mkdir -p $PKG
+                - 'python3.11 -m pip install --platform manylinux2014_aarch64 --target=$PKG --only-binary=:all: --python-version 3.11 -r requirements.txt'
+                - cp handler.py graph_client.py $PKG/
+                - cp -r tools/ $PKG/tools/
+                - cd $PKG && zip -r ../travel-tools.zip . -x "*.pyc" "__pycache__/*" > /dev/null && cd ..
+                - 'aws s3 cp travel-tools.zip "s3://{{ S3Bucket }}/lambda/travel-tools.zip"'
+                #
+                # ── Lambda: trend-collector ──
+                - echo "=== Building trend-collector Lambda package ==="
+                - cd /tmp/travel-md-build/infra/trend-collector-lambda
+                - PKG=deployment_package
+                - rm -rf $PKG && mkdir -p $PKG
+                - 'python3.11 -m pip install --platform manylinux2014_aarch64 --target=$PKG --only-binary=:all: --python-version 3.11 -r requirements.txt'
+                - cp handler.py $PKG/
+                - cp -r tools/ $PKG/tools/
+                - cd $PKG && zip -r ../trend-collector.zip . -x "*.pyc" "__pycache__/*" > /dev/null && cd ..
+                - 'aws s3 cp trend-collector.zip "s3://{{ S3Bucket }}/lambda/trend-collector.zip"'
+                #
+                # ── Agent: travel-agent ──
+                - echo "=== Building travel-agent deployment package ==="
+                - cd /tmp/travel-md-build/agent
+                - PKG=deployment_package
+                - rm -rf $PKG && mkdir -p $PKG
+                - 'python3.11 -m pip install --platform manylinux2014_aarch64 --target=$PKG --only-binary=:all: --python-version 3.11 -r requirements.txt'
+                - cp -r src/ $PKG/src/
+                - cp pyproject.toml $PKG/ 2>/dev/null || true
+                - cd $PKG && zip -r ../travel-agent.zip . -x "*.pyc" "__pycache__/*" > /dev/null && cd ..
+                - 'aws s3 cp travel-agent.zip "s3://{{ S3Bucket }}/agent/travel-agent.zip"'
+                #
+                # ── Agent: trend-agent ──
+                - echo "=== Building trend-agent deployment package ==="
+                - cd /tmp/travel-md-build/trend-agent
+                - PKG=deployment_package
+                - rm -rf $PKG && mkdir -p $PKG
+                - 'python3.11 -m pip install --platform manylinux2014_aarch64 --target=$PKG --only-binary=:all: --python-version 3.11 -r requirements.txt'
+                - cp -r src/ $PKG/src/
+                - cp pyproject.toml $PKG/ 2>/dev/null || true
+                - cd $PKG && zip -r ../trend-agent.zip . -x "*.pyc" "__pycache__/*" > /dev/null && cd ..
+                - 'aws s3 cp trend-agent.zip "s3://{{ S3Bucket }}/agent/trend-agent.zip"'
+                #
+                - echo "=== All 4 packages built and uploaded ==="
+
+  # ============================================================
+  # SSM Document: Deploy Frontend
+  # ============================================================
+
+  FrontendDeploySSMDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: Build and deploy travel-md Next.js frontend
+        parameters:
+          AgentRuntimeArn:
+            type: String
+          TrendCollectorArn:
+            type: String
+          NeptuneHost:
+            type: String
+          ValkeyHost:
+            type: String
+          DynamoTableName:
+            type: String
+          AwsRegion:
+            type: String
+        mainSteps:
+          - name: InstallNodeAndDeploy
+            action: aws:runShellScript
+            inputs:
+              timeoutSeconds: 900
+              runCommand:
+                - '#!/bin/bash'
+                - set -e
+                - echo "=== Installing Node.js 22 ==="
+                - curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+                - dnf install -y nodejs
+                - node --version && npm --version
+                - echo "=== Building frontend ==="
+                - '[ ! -d /tmp/travel-md-build/web ] && cd /tmp && git clone https://github.com/muylucir/travel-md.git travel-md-build'
+                - cd /tmp/travel-md-build/web
+                - |
+                  cat > .env.local <<EOF
+                  AGENTCORE_AGENT_ARN={{ AgentRuntimeArn }}
+                  TREND_COLLECTOR_AGENT_ARN={{ TrendCollectorArn }}
+                  AWS_REGION={{ AwsRegion }}
+                  DYNAMODB_TABLE_NAME={{ DynamoTableName }}
+                  NEPTUNE_HOST={{ NeptuneHost }}
+                  NEPTUNE_PORT=8182
+                  GREMLIN_ENDPOINT=wss://{{ NeptuneHost }}:8182/gremlin
+                  REDIS_HOST={{ ValkeyHost }}
+                  REDIS_PORT=6379
+                  EOF
+                - npm ci
+                - npm run build
+                - echo "=== Deploying standalone output ==="
+                - rm -rf /opt/travel-md-web
+                - mkdir -p /opt/travel-md-web
+                - cp -r .next/standalone/. /opt/travel-md-web/
+                - cp -r .next/static /opt/travel-md-web/.next/static
+                - cp -r public /opt/travel-md-web/public 2>/dev/null || true
+                - cp .env.local /opt/travel-md-web/
+                - echo "=== Creating systemd service ==="
+                - |
+                  cat > /etc/systemd/system/travel-md-web.service <<UNIT
+                  [Unit]
+                  Description=Travel MD Web (Next.js Standalone)
+                  After=network.target
+
+                  [Service]
+                  Type=simple
+                  User=ec2-user
+                  WorkingDirectory=/opt/travel-md-web
+                  EnvironmentFile=/opt/travel-md-web/.env.local
+                  ExecStart=/usr/bin/node server.js
+                  Restart=always
+                  RestartSec=5
+                  Environment=NODE_ENV=production
+                  Environment=PORT=3000
+                  Environment=HOSTNAME=0.0.0.0
+
+                  [Install]
+                  WantedBy=multi-user.target
+                  UNIT
+                - chown -R ec2-user:ec2-user /opt/travel-md-web
+                - systemctl daemon-reload
+                - systemctl enable travel-md-web
+                - systemctl start travel-md-web
+                - echo "=== Waiting for health check ==="
+                - set +e
+                - 'for i in $(seq 1 30); do curl -sf http://localhost:3000 > /dev/null 2>&1 && echo "Health check passed" && break; sleep 2; done'
+                - echo "=== Frontend deployment complete ==="
+
+  # ============================================================
+  # Orchestration Step 1-2: Build Packages on EC2
+  # ============================================================
+
+  RunBuildSSMDoc:
+    Type: Custom::RunSSMDocLambda
+    Properties:
+      ServiceToken: !GetAtt RunSSMDocLambda.Arn
+      ServiceTimeout: 305
+      InstanceId: !Ref OtaInstance
+      DocumentName: !Ref BuildAllSSMDoc
+      CloudWatchLogGroupName: !Sub '/aws/ssm/${BuildAllSSMDoc}'
+      S3Bucket: !Ref CodeBucket
+
+  CheckBuildSSMDoc:
+    Type: Custom::CheckSSMDocLambda
+    DependsOn: RunBuildSSMDoc
+    Properties:
+      ServiceToken: !GetAtt CheckSSMDocLambda.Arn
+      ServiceTimeout: 610
+      InstanceId: !Ref OtaInstance
+      DocumentName: !Ref BuildAllSSMDoc
+
+  # ============================================================
+  # Lambda Functions (after build completes — code from S3)
+  # ============================================================
+
+  TravelToolsLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: CheckBuildSSMDoc
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-travel-tools'
+      Description: OTA Travel Tools — Neptune graph + DynamoDB CRUD + Valkey cache
+      Runtime: python3.11
+      Handler: handler.lambda_handler
+      MemorySize: 512
+      Timeout: 30
+      Architectures: [arm64]
+      Role: !GetAtt TravelToolsLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: lambda/travel-tools.zip
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref NeptuneSG
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !GetAtt NeptuneCluster.Endpoint
+          NEPTUNE_PORT: !GetAtt NeptuneCluster.Port
+          DYNAMODB_TABLE_NAME: !Ref DynamoTable
+          REDIS_HOST: !GetAtt ValkeyCache.Endpoint.Address
+          REDIS_PORT: '6379'
+
+  TrendCollectorLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: CheckBuildSSMDoc
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-trend-collector'
+      Description: OTA Trend Collector — YouTube, Naver, Google Trends, News crawl
+      Runtime: python3.11
+      Handler: handler.lambda_handler
+      MemorySize: 512
+      Timeout: 60
+      Architectures: [arm64]
+      Role: !GetAtt TrendCollectorLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: lambda/trend-collector.zip
+
+  # ============================================================
+  # AgentCore Gateway + Targets (after Lambda)
+  # ============================================================
+
+  OtaGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    DependsOn:
+      - TravelToolsLambda
+      - TrendCollectorLambda
+      - GatewayRolePolicy
+    Properties:
+      Name: !Sub '${AWS::StackName}-gateway'
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt GatewayRole.Arn
+
+  TravelToolsTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: OtaGateway
+    Properties:
+      GatewayIdentifier: !GetAtt OtaGateway.GatewayIdentifier
+      Name: travel-tools
+      Description: OTA Travel Tools — 17 tools (Neptune graph + DynamoDB + Valkey)
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt TravelToolsLambda.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: get_package
+                  Description: Retrieve complete package information including related cities, attractions, hotels, routes, themes, and activities.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      package_code: {Type: string, Description: The unique package code.}
+                    Required: [package_code]
+                - Name: search_packages
+                  Description: Search for existing travel packages matching conditions.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      destination: {Type: string, Description: Region or city name.}
+                      theme: {Type: string}
+                      season: {Type: string}
+                      nights: {Type: integer}
+                      max_budget: {Type: integer}
+                      shopping_max: {Type: integer}
+                    Required: [destination]
+                - Name: get_routes_by_region
+                  Description: Retrieve available flight routes for a region.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      region: {Type: string, Description: Region name.}
+                    Required: [region]
+                - Name: get_attractions_by_city
+                  Description: Retrieve attractions in a city, optionally filtered by category.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      city: {Type: string, Description: City name.}
+                      category: {Type: string}
+                    Required: [city]
+                - Name: get_hotels_by_city
+                  Description: Retrieve hotels in a city, optionally filtered by grade and onsen.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      city: {Type: string, Description: City name.}
+                      grade: {Type: string}
+                      has_onsen: {Type: boolean}
+                    Required: [city]
+                - Name: get_trends
+                  Description: Retrieve active trends and TrendSpot locations with time-decay scoring.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      region: {Type: string, Description: Region name.}
+                      country: {Type: string, Description: Country name.}
+                      city: {Type: string, Description: City name.}
+                      min_score: {Type: integer, Description: Minimum virality score (default 30).}
+                    Required: []
+                - Name: get_similar_packages
+                  Description: Find similar packages via SIMILAR_TO edges.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      package_code: {Type: string, Description: Package code.}
+                    Required: [package_code]
+                - Name: get_nearby_cities
+                  Description: Find cities near a specified city within max distance.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      city: {Type: string, Description: City name.}
+                      max_km: {Type: integer}
+                    Required: [city]
+                - Name: get_cities_by_country
+                  Description: Get all cities for a country from the Knowledge Graph.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      country: {Type: string, Description: Country name.}
+                    Required: [country]
+                - Name: save_product
+                  Description: Save a planned product to DynamoDB.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      product_json: {Type: string, Description: JSON string of the product data.}
+                    Required: [product_json]
+                - Name: get_product
+                  Description: Get a planned product from DynamoDB.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      product_code: {Type: string}
+                    Required: [product_code]
+                - Name: list_products
+                  Description: List planned products from DynamoDB.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      limit: {Type: integer}
+                      region: {Type: string}
+                    Required: []
+                - Name: delete_product
+                  Description: Delete a planned product from DynamoDB.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      product_code: {Type: string}
+                    Required: [product_code]
+                - Name: upsert_trend
+                  Description: Upsert a Trend vertex in Neptune. Creates if not exists, updates if exists.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      title: {Type: string, Description: Trend title.}
+                      type: {Type: string, Description: 'Trend type (e.g. drama, variety, festival, food).'}
+                      source: {Type: string, Description: 'Source (e.g. youtube, naver, google_trends, news).'}
+                      date: {Type: string, Description: ISO date string.}
+                      virality_score: {Type: integer, Description: Virality score 0-100.}
+                      decay_rate: {Type: number, Description: Decay rate 0.0-1.0.}
+                      tier: {Type: string, Description: 'Trend tier (e.g. hot, warm, emerging).'}
+                      keywords:
+                        Type: array
+                        Items: {Type: string}
+                        Description: Related keywords.
+                      evidence:
+                        Type: array
+                        Items:
+                          Type: object
+                          Properties:
+                            source: {Type: string, Description: Evidence source.}
+                            title: {Type: string, Description: Evidence title.}
+                            url: {Type: string, Description: Evidence URL.}
+                            metric: {Type: string, Description: Metric info.}
+                        Description: List of evidence items supporting this trend.
+                    Required: [title, type, source, date, virality_score, decay_rate]
+                - Name: upsert_trend_spot
+                  Description: Upsert a TrendSpot vertex in Neptune.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      name: {Type: string, Description: Spot name.}
+                      description: {Type: string}
+                      category: {Type: string}
+                      lat: {Type: number}
+                      lng: {Type: number}
+                      photo_worthy: {Type: boolean}
+                    Required: [name]
+                - Name: link_trend_to_spot
+                  Description: Link a Trend to a TrendSpot with optional City connection.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      trend_title: {Type: string}
+                      trend_source: {Type: string}
+                      spot_name: {Type: string}
+                      edge_label: {Type: string, Description: FILMED_AT or FEATURES}
+                      city_name: {Type: string, Description: City to link TrendSpot via LOCATED_IN.}
+                    Required: [trend_title, trend_source, spot_name]
+                - Name: invalidate_cache
+                  Description: Delete cached MCP tool results from Valkey.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      tool_pattern: {Type: string, Description: 'Tool name to invalidate e.g. get_trends'}
+                      flush_all: {Type: boolean, Description: If true delete ALL mcp keys}
+                    Required: []
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  TrendCollectorTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    DependsOn: OtaGateway
+    Properties:
+      GatewayIdentifier: !GetAtt OtaGateway.GatewayIdentifier
+      Name: trend-collector
+      Description: OTA Trend Collector — 4 tools (YouTube, Naver, Google Trends, News)
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt TrendCollectorLambda.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: youtube_search
+                  Description: Search YouTube for travel videos in a region.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      region: {Type: string, Description: Region name.}
+                      query: {Type: string, Description: Search query override.}
+                      max_results: {Type: integer, Description: 'Max results (1-50).'}
+                    Required: [region]
+                - Name: naver_search
+                  Description: Search Naver Blog and Cafe for travel content.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      region: {Type: string, Description: Region name.}
+                      query: {Type: string, Description: Search query override.}
+                      max_results: {Type: integer, Description: Max results per source.}
+                    Required: [region]
+                - Name: google_trends
+                  Description: Fetch Google Trends data for travel keywords.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      region: {Type: string, Description: Region name.}
+                      keywords:
+                        Type: array
+                        Items: {Type: string}
+                        Description: 'Keywords to check (max 5).'
+                    Required: [region]
+                - Name: news_crawl
+                  Description: Crawl news articles about a travel region.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      region: {Type: string, Description: Region name.}
+                      query: {Type: string, Description: Search query override.}
+                      max_results: {Type: integer, Description: Max results per source.}
+                    Required: [region]
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # ============================================================
+  # AgentCore Runtimes + Endpoints (after Gateway + Build)
+  # ============================================================
+
+  TravelAgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn:
+      - CheckBuildSSMDoc
+      - AgentCoreRuntimeRolePolicy
+      - TravelToolsTarget
+      - TrendCollectorTarget
+    Properties:
+      AgentRuntimeName: ota_travel_agent
+      Description: OTA Travel Agent — itinerary planning with Neptune GraphRAG + DynamoDB
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Code:
+            S3:
+              Bucket: !Ref CodeBucket
+              Prefix: agent/travel-agent.zip
+          EntryPoint:
+            - src/agentcore_app.py
+          Runtime: PYTHON_3_11
+      RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
+      NetworkConfiguration:
+        NetworkMode: VPC
+        NetworkModeConfig:
+          SecurityGroups:
+            - !Ref NeptuneSG
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+      EnvironmentVariables:
+        GATEWAY_MCP_URL: !Join ['', [!GetAtt OtaGateway.GatewayUrl, '/mcp']]
+        BEDROCK_REGION: us-east-1
+        REDIS_HOST: !GetAtt ValkeyCache.Endpoint.Address
+        GREMLIN_ENDPOINT: !Join ['', ['wss://', !GetAtt NeptuneCluster.Endpoint, ':8182/gremlin']]
+        DYNAMODB_TABLE_NAME: !Ref DynamoTable
+        AWS_DEFAULT_REGION: !Ref 'AWS::Region'
+
+  TrendCollectorRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn:
+      - CheckBuildSSMDoc
+      - AgentCoreRuntimeRolePolicy
+      - TravelToolsTarget
+      - TrendCollectorTarget
+    Properties:
+      AgentRuntimeName: ota_trend_collector
+      Description: OTA Trend Collector — YouTube, Naver, Google Trends, News aggregation
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Code:
+            S3:
+              Bucket: !Ref CodeBucket
+              Prefix: agent/trend-agent.zip
+          EntryPoint:
+            - src/agentcore_app.py
+          Runtime: PYTHON_3_11
+      RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      EnvironmentVariables:
+        GATEWAY_MCP_URL: !Join ['', [!GetAtt OtaGateway.GatewayUrl, '/mcp']]
+        BEDROCK_REGION: us-east-1
+        AWS_DEFAULT_REGION: !Ref 'AWS::Region'
+
+  # ============================================================
+  # Orchestration Step 3-4: Deploy Frontend (after Runtimes ready)
+  # ============================================================
+
+  RunFrontendSSMDoc:
+    Type: Custom::RunSSMDocLambda
+    DependsOn:
+      - TravelAgentRuntime
+      - TrendCollectorRuntime
+    Properties:
+      ServiceToken: !GetAtt RunSSMDocLambda.Arn
+      ServiceTimeout: 305
+      InstanceId: !Ref OtaInstance
+      DocumentName: !Ref FrontendDeploySSMDoc
+      CloudWatchLogGroupName: !Sub '/aws/ssm/${FrontendDeploySSMDoc}'
+      AgentRuntimeArn: !GetAtt TravelAgentRuntime.AgentRuntimeArn
+      TrendCollectorArn: !GetAtt TrendCollectorRuntime.AgentRuntimeArn
+      NeptuneHost: !GetAtt NeptuneCluster.Endpoint
+      ValkeyHost: !GetAtt ValkeyCache.Endpoint.Address
+      DynamoTableName: !Ref DynamoTable
+      AwsRegion: !Ref 'AWS::Region'
+
+  CheckFrontendSSMDoc:
+    Type: Custom::CheckSSMDocLambda
+    DependsOn: RunFrontendSSMDoc
+    Properties:
+      ServiceToken: !GetAtt CheckSSMDocLambda.Arn
+      ServiceTimeout: 610
+      InstanceId: !Ref OtaInstance
+      DocumentName: !Ref FrontendDeploySSMDoc
+
+  # ============================================================
+  # CloudFront Distribution (after frontend deployed)
+  # ============================================================
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: CheckFrontendSSMDoc
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - PATCH
+            - POST
+            - DELETE
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          TargetOriginId: !Sub 'TravelMD-${AWS::StackName}'
+          ViewerProtocolPolicy: redirect-to-https
+        Origins:
+          - DomainName: !GetAtt OtaInstance.PublicDnsName
+            Id: !Sub 'TravelMD-${AWS::StackName}'
+            CustomOriginConfig:
+              HTTPPort: 3000
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 120
+              OriginKeepaliveTimeout: 120
+
+Outputs:
+  CloudFrontURL:
+    Description: Travel MD Application URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  TravelAgentRuntimeArn:
+    Description: Travel Agent AgentCore Runtime ARN
+    Value: !GetAtt TravelAgentRuntime.AgentRuntimeArn
+
+  TravelAgentRuntimeId:
+    Description: Travel Agent AgentCore Runtime ID
+    Value: !GetAtt TravelAgentRuntime.AgentRuntimeId
+
+  TrendCollectorRuntimeArn:
+    Description: Trend Collector AgentCore Runtime ARN
+    Value: !GetAtt TrendCollectorRuntime.AgentRuntimeArn
+
+  TrendCollectorRuntimeId:
+    Description: Trend Collector AgentCore Runtime ID
+    Value: !GetAtt TrendCollectorRuntime.AgentRuntimeId
+
+  GatewayUrl:
+    Description: AgentCore Gateway MCP URL
+    Value: !Join ['', [!GetAtt OtaGateway.GatewayUrl, '/mcp']]
+
+  GatewayArn:
+    Description: AgentCore Gateway ARN
+    Value: !GetAtt OtaGateway.GatewayArn
+
+  NeptuneEndpoint:
+    Description: Neptune Cluster Endpoint
+    Value: !GetAtt NeptuneCluster.Endpoint
+
+  ValkeyEndpoint:
+    Description: Valkey Cache Endpoint
+    Value: !GetAtt ValkeyCache.Endpoint.Address
+
+  DynamoTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref DynamoTable
+
+  CodeBucketName:
+    Description: S3 Bucket for deployment packages
+    Value: !Ref CodeBucket
+
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref OtaInstance
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
