@@ -1029,8 +1029,7 @@ Resources:
           - !Ref PrivateSubnet2
       Environment:
         Variables:
-          NEPTUNE_ENDPOINT: !GetAtt NeptuneCluster.Endpoint
-          NEPTUNE_PORT: !GetAtt NeptuneCluster.Port
+          GREMLIN_ENDPOINT: !Join ['', ['wss://', !GetAtt NeptuneCluster.Endpoint, ':8182/gremlin']]
           DYNAMODB_TABLE_NAME: !Ref DynamoTable
           REDIS_HOST: !GetAtt ValkeyCache.Endpoint.Address
           REDIS_PORT: '6379'
