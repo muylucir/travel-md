@@ -1323,18 +1323,10 @@ Resources:
           Runtime: PYTHON_3_11
       RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
       NetworkConfiguration:
-        NetworkMode: VPC
-        NetworkModeConfig:
-          SecurityGroups:
-            - !Ref NeptuneSG
-          Subnets:
-            - !Ref PrivateSubnet1
-            - !Ref PrivateSubnet2
+        NetworkMode: PUBLIC
       EnvironmentVariables:
         GATEWAY_MCP_URL: !GetAtt OtaGateway.GatewayUrl
         BEDROCK_REGION: us-east-1
-        REDIS_HOST: !GetAtt ValkeyCache.Endpoint.Address
-        GREMLIN_ENDPOINT: !Join ['', ['wss://', !GetAtt NeptuneCluster.Endpoint, ':8182/gremlin']]
         DYNAMODB_TABLE_NAME: !Ref DynamoTable
         AWS_DEFAULT_REGION: !Ref 'AWS::Region'
 

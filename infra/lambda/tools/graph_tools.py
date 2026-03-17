@@ -1,11 +1,15 @@
-"""Graph RAG tools + cache invalidation for Lambda.
+"""Graph RAG tools + Valkey caching + cache invalidation for Lambda.
 
 Reuses the Gremlin query logic from the agent tools but returns raw
 JSON strings suitable for the Lambda handler response.
+
+Read tools are cached in Valkey with per-tool TTLs. Write tools
+bypass the cache. The ``invalidate_cache`` tool deletes cached keys.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -18,12 +22,53 @@ from graph_client import get_connection, map_to_dict, parse_json_field
 
 logger = logging.getLogger(__name__)
 
+# -------------------------------------------------------------------------
+# Valkey cache helpers
+# -------------------------------------------------------------------------
+
+CACHE_TTL = {
+    "get_package": 43200,            # 12h — semi-static
+    "search_packages": 21600,        # 6h  — dynamic (query-dependent)
+    "get_routes_by_region": 43200,   # 12h — semi-static
+    "get_attractions_by_city": 43200,# 12h — semi-static
+    "get_hotels_by_city": 43200,     # 12h — semi-static
+    "get_trends": 3600,              # 1h  — volatile
+    "get_similar_packages": 43200,   # 12h — semi-static
+    "get_nearby_cities": 86400,      # 24h — static
+    "get_cities_by_country": 86400,  # 24h — static
+}
+NEGATIVE_TTL = 300  # 5min for "not found" results
+
+
+def _make_cache_key(tool_name: str, **kwargs) -> str:
+    args_str = json.dumps(kwargs, sort_keys=True, ensure_ascii=False, default=str)
+    args_hash = hashlib.md5(args_str.encode()).hexdigest()[:12]
+    return f"mcp:{tool_name}:{args_hash}"
+
+
+def _cache_get(key: str) -> str | None:
+    try:
+        return _get_redis().get(key)
+    except Exception:
+        return None
+
+
+def _cache_set(key: str, value: str, ttl: int) -> None:
+    try:
+        _get_redis().setex(key, ttl, value)
+    except Exception:
+        pass
+
 
 # -------------------------------------------------------------------------
 # 1. get_package
 # -------------------------------------------------------------------------
 def get_package(package_code: str) -> str:
     """Retrieve complete package information including related entities."""
+    cache_key = _make_cache_key("get_package", package_code=package_code)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     pkg_maps = (
@@ -34,7 +79,9 @@ def get_package(package_code: str) -> str:
         .toList()
     )
     if not pkg_maps:
-        return json.dumps({"error": f"Package '{package_code}' not found"}, ensure_ascii=False)
+        result = json.dumps({"error": f"Package '{package_code}' not found"}, ensure_ascii=False)
+        _cache_set(cache_key, result, NEGATIVE_TTL)
+        return result
 
     package = map_to_dict(pkg_maps[0])
     for field in ("season", "hashtags", "guide_fee"):
@@ -124,7 +171,9 @@ def get_package(package_code: str) -> str:
         "themes": theme_list,
         "activities": activity_list,
     }
-    return json.dumps(result, ensure_ascii=False, default=str)
+    result_str = json.dumps(result, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_package"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -139,6 +188,12 @@ def search_packages(
     shopping_max: int = -1,
 ) -> str:
     """Search for existing travel packages matching conditions."""
+    cache_key = _make_cache_key("search_packages", destination=destination, theme=theme,
+                                season=season, nights=nights, max_budget=max_budget,
+                                shopping_max=shopping_max)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     t = (
@@ -170,7 +225,9 @@ def search_packages(
                 pkg[field] = parse_json_field(pkg[field])
         packages.append(pkg)
 
-    return json.dumps({"packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
+    result_str = json.dumps({"packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["search_packages"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -178,6 +235,10 @@ def search_packages(
 # -------------------------------------------------------------------------
 def get_routes_by_region(region: str) -> str:
     """Retrieve available flight routes for a region."""
+    cache_key = _make_cache_key("get_routes_by_region", region=region)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     results = (
@@ -186,7 +247,9 @@ def get_routes_by_region(region: str) -> str:
         .valueMap(True).toList()
     )
     routes = [map_to_dict(r) for r in results]
-    return json.dumps({"routes": routes, "count": len(routes)}, ensure_ascii=False, default=str)
+    result_str = json.dumps({"routes": routes, "count": len(routes)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_routes_by_region"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -194,6 +257,10 @@ def get_routes_by_region(region: str) -> str:
 # -------------------------------------------------------------------------
 def get_attractions_by_city(city: str, category: str = "") -> str:
     """Retrieve attractions in a city, optionally filtered by category."""
+    cache_key = _make_cache_key("get_attractions_by_city", city=city, category=category)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     t = (
@@ -205,7 +272,9 @@ def get_attractions_by_city(city: str, category: str = "") -> str:
 
     results = t.valueMap(True).toList()
     attractions = [map_to_dict(a) for a in results]
-    return json.dumps({"attractions": attractions, "count": len(attractions)}, ensure_ascii=False, default=str)
+    result_str = json.dumps({"attractions": attractions, "count": len(attractions)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_attractions_by_city"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -213,6 +282,10 @@ def get_attractions_by_city(city: str, category: str = "") -> str:
 # -------------------------------------------------------------------------
 def get_hotels_by_city(city: str, grade: str = "", has_onsen: bool = False) -> str:
     """Retrieve hotels in a city, optionally filtered by grade and onsen."""
+    cache_key = _make_cache_key("get_hotels_by_city", city=city, grade=grade, has_onsen=has_onsen)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     t = (
@@ -226,7 +299,9 @@ def get_hotels_by_city(city: str, grade: str = "", has_onsen: bool = False) -> s
 
     results = t.valueMap(True).toList()
     hotels = [map_to_dict(h) for h in results]
-    return json.dumps({"hotels": hotels, "count": len(hotels)}, ensure_ascii=False, default=str)
+    result_str = json.dumps({"hotels": hotels, "count": len(hotels)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_hotels_by_city"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -255,6 +330,10 @@ def _infer_tier(decay_rate: float) -> str:
 
 def get_trends(region: str = "", country: str = "", city: str = "", min_score: int = 30) -> str:
     """Retrieve active trends and TrendSpot locations for a region, country, or city."""
+    cache_key = _make_cache_key("get_trends", region=region, country=country, city=city, min_score=min_score)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     # Build location filter
@@ -313,7 +392,9 @@ def get_trends(region: str = "", country: str = "", city: str = "", min_score: i
     trends.sort(key=lambda t: t["effective_score"], reverse=True)
     trends = trends[:10]
 
-    return json.dumps({"trends": trends, "count": len(trends)}, ensure_ascii=False, default=str)
+    result_str = json.dumps({"trends": trends, "count": len(trends)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_trends"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -321,6 +402,10 @@ def get_trends(region: str = "", country: str = "", city: str = "", min_score: i
 # -------------------------------------------------------------------------
 def get_similar_packages(package_code: str) -> str:
     """Find packages similar to the given package via SIMILAR_TO edges."""
+    cache_key = _make_cache_key("get_similar_packages", package_code=package_code)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     results = (
@@ -344,7 +429,9 @@ def get_similar_packages(package_code: str) -> str:
             "similarity_score": r.get("score", 0),
         })
 
-    return json.dumps({"similar_packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
+    result_str = json.dumps({"similar_packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_similar_packages"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -507,6 +594,10 @@ def link_trend_to_spot(
 # -------------------------------------------------------------------------
 def get_nearby_cities(city: str, max_km: int = 100) -> str:
     """Find cities near the specified city within a maximum distance."""
+    cache_key = _make_cache_key("get_nearby_cities", city=city, max_km=max_km)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
 
     results = (
@@ -525,7 +616,9 @@ def get_nearby_cities(city: str, max_km: int = 100) -> str:
         city_data["distance_km"] = r.get("distance_km", 0)
         cities.append(city_data)
 
-    return json.dumps({"nearby_cities": cities, "count": len(cities)}, ensure_ascii=False, default=str)
+    result_str = json.dumps({"nearby_cities": cities, "count": len(cities)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_nearby_cities"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
@@ -533,6 +626,10 @@ def get_nearby_cities(city: str, max_km: int = 100) -> str:
 # -------------------------------------------------------------------------
 def get_cities_by_country(country: str) -> str:
     """Get all cities for a country from the Knowledge Graph."""
+    cache_key = _make_cache_key("get_cities_by_country", country=country)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     g = get_connection()
     results = (
         g.V().hasLabel("City").has("country", country)
@@ -549,7 +646,9 @@ def get_cities_by_country(country: str) -> str:
             region = region[0]
         if name:
             cities.append({"name": name, "region": region})
-    return json.dumps({"country": country, "cities": cities, "count": len(cities)}, ensure_ascii=False)
+    result_str = json.dumps({"country": country, "cities": cities, "count": len(cities)}, ensure_ascii=False)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_cities_by_country"])
+    return result_str
 
 
 # -------------------------------------------------------------------------
