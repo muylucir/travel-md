@@ -13,6 +13,7 @@ import PreviewStep from "./PreviewStep";
 import UploadStep from "./UploadStep";
 import {
   FIELD_TO_NODE_HINTS,
+  type GraphSchema,
   type NodeDesignConfig,
   type EdgeMappingRule,
   type DuplicateStrategy,
@@ -26,6 +27,9 @@ function generateId() {
 export default function UploadWizard() {
   const router = useRouter();
   const [activeStepIndex, setActiveStepIndex] = useState(0);
+
+  // Schema selection
+  const [selectedSchema, setSelectedSchema] = useState<GraphSchema | null>(null);
 
   // Step 1: File upload
   const [rawData, setRawData] = useState<Record<string, unknown>[] | null>(
@@ -55,6 +59,81 @@ export default function UploadWizard() {
   // Validation errors
   const [validationError, setValidationError] = useState<string | null>(null);
 
+  // Apply schema to node design and edge mappings
+  const applySchemaToFields = useCallback(
+    (schema: GraphSchema | null, fields: string[]) => {
+      if (schema) {
+        // Schema-driven mapping
+        const schemaFieldNames = new Set(schema.properties.map((p) => p.name));
+        const mappings = fields.map((f) => ({
+          jsonField: f,
+          nodeProperty: f,
+          include: schemaFieldNames.has(f),
+        }));
+
+        setNodeDesign({
+          nodeLabel: schema.nodeLabel,
+          idField: schema.idField,
+          propertyMappings: mappings,
+        });
+
+        setEdgeMappings(
+          schema.edges.map((e) => ({
+            id: generateId(),
+            sourceField: e.sourceField,
+            targetNodeLabel: e.targetNodeLabel,
+            targetMatchProperty: e.targetMatchProperty,
+            edgeLabel: e.edgeLabel,
+            direction: e.direction as "out" | "in",
+            autoCreateTarget: e.autoCreateTarget,
+          }))
+        );
+      } else {
+        // Manual mode: all fields included, auto-suggest edges
+        const mappings = fields.map((f) => ({
+          jsonField: f,
+          nodeProperty: f,
+          include: true,
+        }));
+        setNodeDesign((prev) => ({
+          ...prev,
+          propertyMappings: mappings,
+          idField: fields[0] || "",
+        }));
+
+        const autoEdges: EdgeMappingRule[] = [];
+        for (const field of fields) {
+          const hint = FIELD_TO_NODE_HINTS[field.toLowerCase()];
+          if (hint) {
+            autoEdges.push({
+              id: generateId(),
+              sourceField: field,
+              targetNodeLabel: hint.nodeLabel,
+              targetMatchProperty: hint.matchProp,
+              edgeLabel: hint.edgeLabel,
+              direction: "out",
+              autoCreateTarget: true,
+            });
+          }
+        }
+        setEdgeMappings(autoEdges);
+      }
+    },
+    []
+  );
+
+  // Schema selection handler
+  const handleSchemaSelect = useCallback(
+    (schema: GraphSchema | null) => {
+      setSelectedSchema(schema);
+      // Re-apply mapping if data is already loaded
+      if (rawData && jsonFields.length > 0) {
+        applySchemaToFields(schema, jsonFields);
+      }
+    },
+    [rawData, jsonFields, applySchemaToFields]
+  );
+
   // File load handler
   const handleFileLoad = useCallback(
     (data: Record<string, unknown>[], name: string) => {
@@ -64,41 +143,13 @@ export default function UploadWizard() {
       const fields = Object.keys(data[0] || {});
       setJsonFields(fields);
 
-      // Initialize property mappings
-      const mappings = fields.map((f) => ({
-        jsonField: f,
-        nodeProperty: f,
-        include: true,
-      }));
-      setNodeDesign((prev) => ({
-        ...prev,
-        propertyMappings: mappings,
-        idField: fields[0] || "",
-      }));
-
-      // Auto-suggest edge mappings
-      const autoEdges: EdgeMappingRule[] = [];
-      for (const field of fields) {
-        const hint = FIELD_TO_NODE_HINTS[field.toLowerCase()];
-        if (hint) {
-          autoEdges.push({
-            id: generateId(),
-            sourceField: field,
-            targetNodeLabel: hint.nodeLabel,
-            targetMatchProperty: hint.matchProp,
-            edgeLabel: hint.edgeLabel,
-            direction: "out",
-            autoCreateTarget: true,
-          });
-        }
-      }
-      setEdgeMappings(autoEdges);
+      applySchemaToFields(selectedSchema, fields);
 
       // Reset downstream state
       setDuplicateStrategy("skip");
       setUploadResult(null);
     },
-    []
+    [selectedSchema, applySchemaToFields]
   );
 
   // Validate current step before navigation
@@ -234,6 +285,8 @@ export default function UploadWizard() {
                 rawData={rawData}
                 fileName={fileName}
                 onFileLoad={handleFileLoad}
+                selectedSchema={selectedSchema}
+                onSchemaSelect={handleSchemaSelect}
               />
             ),
           },

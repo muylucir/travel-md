@@ -53,6 +53,11 @@ export default function Navigation() {
             },
             {
               type: "link",
+              text: "스키마 관리",
+              href: "/graph/schemas",
+            },
+            {
+              type: "link",
               text: "그래프 업로드",
               href: "/graph/upload",
             },

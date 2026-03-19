@@ -1,3 +1,34 @@
+// ─── Graph Schema (Template) ───
+
+export interface SchemaProperty {
+  name: string;
+  type: "string" | "number" | "boolean" | "json";
+  required: boolean;
+}
+
+export interface SchemaEdge {
+  sourceField: string;
+  targetNodeLabel: string;
+  targetMatchProperty: string;
+  edgeLabel: string;
+  direction: "out" | "in";
+  autoCreateTarget: boolean;
+}
+
+export interface GraphSchema {
+  schemaId: string;
+  name: string;
+  description: string;
+  nodeLabel: string;
+  idField: string;
+  properties: SchemaProperty[];
+  edges: SchemaEdge[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ─── Upload Config ───
+
 export interface PropertyMapping {
   jsonField: string;
   nodeProperty: string;
