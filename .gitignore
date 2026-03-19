@@ -1,4 +1,5 @@
-files/
+files/*
+!files/*-guide.md
 ref/
 .mcp.json
 .claude/

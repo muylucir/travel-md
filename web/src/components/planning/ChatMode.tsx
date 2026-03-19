@@ -10,6 +10,7 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import ProgressBar from "@cloudscape-design/components/progress-bar";
 import type { ChatMessage, ProgressData } from "@/lib/types";
 import type { PlanningStatus } from "@/hooks/useChat";
+import MarkdownContent from "./MarkdownContent";
 
 interface ChatModeProps {
   messages: ChatMessage[];
@@ -156,16 +157,15 @@ function ChatBubble({ message, isStreaming }: { message: ChatMessage; isStreamin
           borderRadius: isUser ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
           backgroundColor: isUser ? "#0972d3" : "#f2f3f3",
           color: isUser ? "#ffffff" : "#000716",
-          whiteSpace: "pre-wrap",
-          lineHeight: 1.6,
-          fontSize: 14,
         }}
       >
         <Box variant="small" color={isUser ? "inherit" : "text-body-secondary"}>
           {isUser ? "MD" : "AI 기획 어시스턴트"}
           {isStreaming && " ●"}
         </Box>
-        <div style={{ marginTop: 4 }}>{message.content}</div>
+        <div style={{ marginTop: 4 }}>
+          <MarkdownContent content={message.content} isUser={isUser} />
+        </div>
       </div>
     </div>
   );
