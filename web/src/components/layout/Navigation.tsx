@@ -51,6 +51,11 @@ export default function Navigation() {
               text: "그래프 탐색기",
               href: "/graph",
             },
+            {
+              type: "link",
+              text: "그래프 업로드",
+              href: "/graph/upload",
+            },
           ],
         },
       ]}
