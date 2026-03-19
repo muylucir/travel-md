@@ -233,6 +233,16 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:s3:::${CodeBucket}'
                   - !Sub 'arn:aws:s3:::${CodeBucket}/*'
+              - Sid: BulkLoadS3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt BulkLoadBucket.Arn
+                  - !Sub '${BulkLoadBucket.Arn}/*'
               - Sid: DynamoDBAccess
                 Effect: Allow
                 Action:
@@ -245,6 +255,8 @@ Resources:
                 Resource:
                   - !GetAtt DynamoTable.Arn
                   - !Sub '${DynamoTable.Arn}/index/*'
+                  - !GetAtt GraphSchemasTable.Arn
+                  - !Sub '${GraphSchemasTable.Arn}/index/*'
               - Sid: NeptuneAccess
                 Effect: Allow
                 Action:
@@ -426,6 +438,42 @@ Resources:
   CodeBucket:
     Type: AWS::S3::Bucket
 
+  # S3 Bucket for Neptune Bulk Loader CSV staging
+  BulkLoadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldUploads
+            Status: Enabled
+            ExpirationInDays: 7
+            Prefix: graph-upload/
+
+  # IAM Role for Neptune to read from S3 (Bulk Loader)
+  NeptuneBulkLoadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-neptune-s3-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NeptuneS3Read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BulkLoadBucket.Arn
+                  - !Sub '${BulkLoadBucket.Arn}/*'
+
   # ============================================================
   # Data Layer — Neptune Serverless, Valkey Serverless, DynamoDB
   # ============================================================
@@ -440,6 +488,7 @@ Resources:
 
   NeptuneCluster:
     Type: AWS::Neptune::DBCluster
+    DependsOn: NeptuneBulkLoadRole
     Properties:
       DBClusterIdentifier: !Sub '${AWS::StackName}-neptune'
       EngineVersion: '1.4.1.0'
@@ -448,6 +497,8 @@ Resources:
         - !Ref NeptuneSG
       IamAuthEnabled: true
       StorageEncrypted: true
+      AssociatedRoles:
+        - RoleArn: !GetAtt NeptuneBulkLoadRole.Arn
       ServerlessScalingConfiguration:
         MinCapacity: 2
         MaxCapacity: 16
@@ -484,6 +535,18 @@ Resources:
           AttributeType: S
       KeySchema:
         - AttributeName: product_code
+          KeyType: HASH
+
+  GraphSchemasTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-graph-schemas'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: schemaId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: schemaId
           KeyType: HASH
 
   # ============================================================
@@ -910,6 +973,12 @@ Resources:
             type: String
           DynamoTableName:
             type: String
+          SchemaTableName:
+            type: String
+          BulkLoadS3Bucket:
+            type: String
+          NeptuneLoadIamRole:
+            type: String
           AwsRegion:
             type: String
         mainSteps:
@@ -933,11 +1002,14 @@ Resources:
                   TREND_COLLECTOR_AGENT_ARN={{ TrendCollectorArn }}
                   AWS_REGION={{ AwsRegion }}
                   DYNAMODB_TABLE_NAME={{ DynamoTableName }}
+                  SCHEMA_TABLE_NAME={{ SchemaTableName }}
                   NEPTUNE_HOST={{ NeptuneHost }}
                   NEPTUNE_PORT=8182
                   GREMLIN_ENDPOINT=wss://{{ NeptuneHost }}:8182/gremlin
                   REDIS_HOST={{ ValkeyHost }}
                   REDIS_PORT=6379
+                  BULK_LOAD_S3_BUCKET={{ BulkLoadS3Bucket }}
+                  NEPTUNE_LOAD_IAM_ROLE={{ NeptuneLoadIamRole }}
                   EOF
                 - npm ci
                 - npm run build
@@ -1377,6 +1449,9 @@ Resources:
       NeptuneHost: !GetAtt NeptuneCluster.Endpoint
       ValkeyHost: !GetAtt ValkeyCache.Endpoint.Address
       DynamoTableName: !Ref DynamoTable
+      SchemaTableName: !Ref GraphSchemasTable
+      BulkLoadS3Bucket: !Ref BulkLoadBucket
+      NeptuneLoadIamRole: !GetAtt NeptuneBulkLoadRole.Arn
       AwsRegion: !Ref 'AWS::Region'
 
   CheckFrontendSSMDoc:
@@ -1461,6 +1536,18 @@ Outputs:
   DynamoTableName:
     Description: DynamoDB Table Name
     Value: !Ref DynamoTable
+
+  GraphSchemasTableName:
+    Description: DynamoDB Table Name for Graph Schemas
+    Value: !Ref GraphSchemasTable
+
+  BulkLoadBucketName:
+    Description: S3 Bucket for Neptune Bulk Loader CSV staging
+    Value: !Ref BulkLoadBucket
+
+  NeptuneBulkLoadRoleArn:
+    Description: IAM Role ARN for Neptune Bulk Loader
+    Value: !GetAtt NeptuneBulkLoadRole.Arn
 
   CodeBucketName:
     Description: S3 Bucket for deployment packages
