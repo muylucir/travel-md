@@ -23,9 +23,22 @@ create-table:
 		--billing-mode PAY_PER_REQUEST \
 		--region ap-northeast-2
 
+create-schema-table:
+	aws dynamodb create-table \
+		--table-name graph-schemas \
+		--attribute-definitions AttributeName=schemaId,AttributeType=S \
+		--key-schema AttributeName=schemaId,KeyType=HASH \
+		--billing-mode PAY_PER_REQUEST \
+		--region ap-northeast-2
+
 delete-table:
 	aws dynamodb delete-table \
 		--table-name ota-planned-products \
+		--region ap-northeast-2
+
+delete-schema-table:
+	aws dynamodb delete-table \
+		--table-name graph-schemas \
 		--region ap-northeast-2
 
 # Lambda + Gateway

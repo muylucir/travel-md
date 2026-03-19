@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import SpaceBetween from "@cloudscape-design/components/space-between";
@@ -13,6 +13,7 @@ import Table from "@cloudscape-design/components/table";
 import Box from "@cloudscape-design/components/box";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import Autosuggest from "@cloudscape-design/components/autosuggest";
+import Alert from "@cloudscape-design/components/alert";
 import CytoscapeGraph from "@/components/graph/CytoscapeGraph";
 import type { GraphNode, GraphLink } from "@/lib/types";
 import { NODE_TYPE_COLORS } from "@/lib/types";
@@ -57,6 +58,87 @@ export default function SchemaEditor({
     initial?.properties || [{ name: "", type: "string", required: true }]
   );
   const [edges, setEdges] = useState<SchemaEdge[]>(initial?.edges || []);
+  const [importMsg, setImportMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+  // --- Import schema definition from JSON file ---
+  const handleImportSchema = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const schema = JSON.parse(ev.target?.result as string);
+
+          if (!schema.nodeLabel) {
+            setImportMsg({ type: "error", text: "nodeLabel 필드가 필요합니다." });
+            return;
+          }
+
+          // Apply schema definition to form
+          if (schema.name) setName(schema.name);
+          if (schema.description) setDescription(schema.description);
+          setNodeLabel(schema.nodeLabel);
+          setUseCustomLabel(!EXISTING_NODE_LABELS.includes(schema.nodeLabel));
+          if (schema.idField) setIdField(schema.idField);
+
+          if (Array.isArray(schema.properties)) {
+            setProperties(
+              schema.properties.map((p: Record<string, unknown>) => ({
+                name: String(p.name || ""),
+                type: (p.type as SchemaProperty["type"]) || "string",
+                required: Boolean(p.required),
+              }))
+            );
+          }
+
+          if (Array.isArray(schema.edges)) {
+            setEdges(
+              schema.edges.map((e: Record<string, unknown>) => ({
+                sourceField: String(e.sourceField || ""),
+                targetNodeLabel: String(e.targetNodeLabel || ""),
+                targetMatchProperty: String(e.targetMatchProperty || "name"),
+                edgeLabel: String(e.edgeLabel || ""),
+                direction: (e.direction as "out" | "in") || "out",
+                autoCreateTarget: e.autoCreateTarget !== false,
+              }))
+            );
+          }
+
+          const propCount = schema.properties?.length || 0;
+          const edgeCount = schema.edges?.length || 0;
+          setImportMsg({
+            type: "success",
+            text: `"${schema.name || schema.nodeLabel}" 스키마 로드 완료 — 속성 ${propCount}개, 엣지 ${edgeCount}개`,
+          });
+        } catch {
+          setImportMsg({ type: "error", text: "JSON 파싱에 실패했습니다. 형식을 확인하세요." });
+        }
+      };
+      reader.readAsText(file);
+      e.target.value = "";
+    },
+    []
+  );
+
+  // --- Export current schema as JSON ---
+  const handleExportSchema = useCallback(() => {
+    const schema = {
+      name,
+      description,
+      nodeLabel,
+      idField,
+      properties: properties.filter((p) => p.name),
+      edges: edges.filter((e) => e.sourceField && e.targetNodeLabel && e.edgeLabel),
+    };
+    const blob = new Blob([JSON.stringify(schema, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${nodeLabel || "schema"}.schema.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [name, description, nodeLabel, idField, properties, edges]);
 
   const labelOptions = [
     ...EXISTING_NODE_LABELS.map((l) => ({ value: l, label: l })),
@@ -159,6 +241,54 @@ export default function SchemaEditor({
 
   return (
     <SpaceBetween size="l">
+      {/* Schema JSON Import / Export */}
+      <Container
+        header={
+          <Header variant="h2">
+            스키마 JSON 가져오기 / 내보내기
+          </Header>
+        }
+      >
+        <SpaceBetween size="m">
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <input
+              id="schema-json-import"
+              type="file"
+              accept=".json"
+              onChange={handleImportSchema}
+              style={{ display: "none" }}
+            />
+            <Button
+              iconName="upload"
+              onClick={() =>
+                document.getElementById("schema-json-import")?.click()
+              }
+            >
+              JSON에서 가져오기
+            </Button>
+            <Button
+              iconName="download"
+              onClick={handleExportSchema}
+              disabled={!nodeLabel}
+            >
+              JSON으로 내보내기
+            </Button>
+            <Box variant="small" color="text-body-secondary">
+              스키마 정의 JSON 파일을 가져오거나, 현재 설정을 내보낼 수 있습니다
+            </Box>
+          </div>
+          {importMsg && (
+            <Alert
+              type={importMsg.type}
+              dismissible
+              onDismiss={() => setImportMsg(null)}
+            >
+              {importMsg.text}
+            </Alert>
+          )}
+        </SpaceBetween>
+      </Container>
+
       {/* Basic Info */}
       <Container header={<Header variant="h2">기본 정보</Header>}>
         <ColumnLayout columns={2}>
