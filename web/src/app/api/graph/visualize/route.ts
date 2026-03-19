@@ -15,6 +15,7 @@ const __ = gremlin.process.statics as any;
  *
  * Query params:
  *   types - comma-separated node type filter (e.g., "Package,City")
+ *   limit - max nodes to return (default 200, 0 = unlimited)
  */
 export async function GET(request: NextRequest) {
   try {
@@ -23,9 +24,11 @@ export async function GET(request: NextRequest) {
     const types = typesParam
       ? typesParam.split(",").map((t) => t.trim()).filter(Boolean)
       : [];
+    const limitParam = searchParams.get("limit");
+    const nodeLimit = limitParam !== null ? parseInt(limitParam, 10) : 200;
 
     // --- L1: in-memory cache ---
-    const cacheKey = `graph:${types.join(",") || "all"}`;
+    const cacheKey = `graph:${types.join(",") || "all"}:${nodeLimit}`;
     const l1 = cacheGet<GraphData>(cacheKey);
     if (l1) return NextResponse.json(l1);
 
@@ -44,6 +47,9 @@ export async function GET(request: NextRequest) {
       vertexTraversal = vertexTraversal.hasLabel(...types);
     }
 
+    if (nodeLimit > 0) {
+      vertexTraversal = vertexTraversal.limit(nodeLimit);
+    }
     const vertices = await vertexTraversal.valueMap(true).toList();
 
     const nodes = vertices.map((v: unknown) => {
