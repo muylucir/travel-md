@@ -55,6 +55,8 @@ export default function UploadWizard() {
   // Step 5: Upload
   const [uploading, setUploading] = useState(false);
   const [uploadResult, setUploadResult] = useState<UploadResult | null>(null);
+  const [bulkLoadId, setBulkLoadId] = useState<string | null>(null);
+  const [bulkStatus, setBulkStatus] = useState<string | null>(null);
 
   // Validation errors
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -195,29 +197,108 @@ export default function UploadWizard() {
     }
   };
 
-  // Upload handler
+  // Bulk loader threshold
+  const BULK_THRESHOLD = 500;
+  const useBulk = (rawData?.length || 0) > BULK_THRESHOLD;
+
+  // Poll bulk loader status
+  const pollBulkStatus = useCallback(
+    async (loadId: string) => {
+      const maxPolls = 120; // 10 min max
+      for (let i = 0; i < maxPolls; i++) {
+        await new Promise((r) => setTimeout(r, 5000)); // 5s interval
+        try {
+          const res = await fetch(`/api/graph/upload/bulk/${loadId}`);
+          const data = await res.json();
+          const status = data.status;
+          setBulkStatus(status);
+
+          if (
+            status === "LOAD_COMPLETED" ||
+            status === "LOAD_FAILED" ||
+            status === "LOAD_CANCELLED" ||
+            status === "ERROR"
+          ) {
+            setUploadResult({
+              nodesCreated: data.totalRecords || 0,
+              nodesSkipped: data.totalDuplicates || 0,
+              nodesUpdated: 0,
+              edgesCreated: 0,
+              edgesSkipped: 0,
+              targetNodesCreated: 0,
+              errors:
+                status === "LOAD_COMPLETED"
+                  ? []
+                  : data.errors || [`벌크 로딩 실패: ${status}`],
+              durationMs: data.totalTimeMillis || 0,
+            });
+            setUploading(false);
+            return;
+          }
+        } catch {
+          // Continue polling on network errors
+        }
+      }
+      setUploading(false);
+      setBulkStatus("TIMEOUT");
+    },
+    []
+  );
+
+  // Upload handler — auto-selects Gremlin or Bulk Loader
   const handleUpload = useCallback(async () => {
     if (!rawData) return;
 
     setUploading(true);
     setUploadResult(null);
+    setBulkLoadId(null);
+    setBulkStatus(null);
+
+    const filteredEdges = edgeMappings.filter(
+      (r) => r.sourceField && r.targetNodeLabel && r.edgeLabel
+    );
 
     try {
-      const res = await fetch("/api/graph/upload", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          data: rawData,
-          nodeDesign,
-          edgeMappings: edgeMappings.filter(
-            (r) => r.sourceField && r.targetNodeLabel && r.edgeLabel
-          ),
-          duplicateStrategy,
-        }),
-      });
+      if (useBulk) {
+        // --- Neptune Bulk Loader ---
+        setBulkStatus("CONVERTING");
+        const res = await fetch("/api/graph/upload/bulk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            data: rawData,
+            nodeDesign,
+            edgeMappings: filteredEdges,
+          }),
+        });
 
-      const result = await res.json();
-      setUploadResult(result);
+        const result = await res.json();
+        if (result.error) {
+          throw new Error(result.error);
+        }
+
+        setBulkLoadId(result.loadId);
+        setBulkStatus("LOAD_IN_PROGRESS");
+
+        // Start polling
+        pollBulkStatus(result.loadId);
+      } else {
+        // --- Gremlin sequential ---
+        const res = await fetch("/api/graph/upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            data: rawData,
+            nodeDesign,
+            edgeMappings: filteredEdges,
+            duplicateStrategy,
+          }),
+        });
+
+        const result = await res.json();
+        setUploadResult(result);
+        setUploading(false);
+      }
     } catch (err) {
       setUploadResult({
         nodesCreated: 0,
@@ -231,10 +312,9 @@ export default function UploadWizard() {
         ],
         durationMs: 0,
       });
-    } finally {
       setUploading(false);
     }
-  }, [rawData, nodeDesign, edgeMappings, duplicateStrategy]);
+  }, [rawData, nodeDesign, edgeMappings, duplicateStrategy, useBulk, pollBulkStatus]);
 
   return (
     <SpaceBetween size="l">
@@ -350,6 +430,8 @@ export default function UploadWizard() {
                 duplicateStrategy={duplicateStrategy}
                 uploading={uploading}
                 uploadResult={uploadResult}
+                useBulk={useBulk}
+                bulkStatus={bulkStatus}
               />
             ) : (
               <Alert type="warning">먼저 파일을 업로드하세요.</Alert>

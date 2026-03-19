@@ -23,12 +23,24 @@ interface UploadStepProps {
   duplicateStrategy: DuplicateStrategy;
   uploading: boolean;
   uploadResult: UploadResult | null;
+  useBulk?: boolean;
+  bulkStatus?: string | null;
 }
 
 const STRATEGY_LABELS: Record<DuplicateStrategy, string> = {
   skip: "건너뛰기",
   update: "업데이트",
   create: "새로 생성",
+};
+
+const BULK_STATUS_LABELS: Record<string, { label: string; type: "loading" | "success" | "error" | "info" }> = {
+  CONVERTING: { label: "CSV 변환 및 S3 업로드 중...", type: "loading" },
+  LOAD_IN_PROGRESS: { label: "Neptune Bulk Loader 실행 중...", type: "loading" },
+  LOAD_COMPLETED: { label: "벌크 로딩 완료", type: "success" },
+  LOAD_FAILED: { label: "벌크 로딩 실패", type: "error" },
+  LOAD_CANCELLED: { label: "벌크 로딩 취소됨", type: "error" },
+  TIMEOUT: { label: "상태 조회 시간 초과", type: "error" },
+  ERROR: { label: "오류 발생", type: "error" },
 };
 
 export default function UploadStep({
@@ -38,6 +50,8 @@ export default function UploadStep({
   duplicateStrategy,
   uploading,
   uploadResult,
+  useBulk,
+  bulkStatus,
 }: UploadStepProps) {
   if (uploadResult) {
     const hasErrors = uploadResult.errors.length > 0;
@@ -129,17 +143,30 @@ export default function UploadStep({
   }
 
   if (uploading) {
+    const bulkInfo = bulkStatus ? BULK_STATUS_LABELS[bulkStatus] : null;
+
     return (
       <SpaceBetween size="l">
         <Container header={<Header variant="h2">업로드 진행 중</Header>}>
           <SpaceBetween size="m">
+            {useBulk && (
+              <Alert type="info">
+                <strong>Neptune Bulk Loader</strong> 사용 중 —{" "}
+                {rawData.length.toLocaleString()}건 대용량 데이터를 고속 로딩합니다.
+              </Alert>
+            )}
             <ProgressBar
               status="in-progress"
-              label="업로드 진행 중..."
-              description="Neptune 그래프 DB에 데이터를 업로드하고 있습니다. 잠시 기다려주세요."
+              label={bulkInfo?.label || "업로드 진행 중..."}
+              description={
+                useBulk
+                  ? "JSON → CSV 변환 → S3 업로드 → Neptune Bulk Loader 실행"
+                  : "Neptune 그래프 DB에 데이터를 업로드하고 있습니다."
+              }
             />
-            <StatusIndicator type="loading">
-              {rawData.length}건의 데이터를 처리하고 있습니다...
+            <StatusIndicator type={bulkInfo?.type || "loading"}>
+              {bulkInfo?.label ||
+                `${rawData.length.toLocaleString()}건의 데이터를 처리하고 있습니다...`}
             </StatusIndicator>
           </SpaceBetween>
         </Container>
@@ -152,10 +179,18 @@ export default function UploadStep({
 
   return (
     <SpaceBetween size="l">
-      <Alert type="info">
-        아래 설정을 확인한 후 &quot;업로드 실행&quot; 버튼을 클릭하세요.
-        업로드가 시작되면 취소할 수 없습니다.
-      </Alert>
+      {useBulk ? (
+        <Alert type="info">
+          <strong>{rawData.length.toLocaleString()}건</strong> 대용량 데이터 감지 —{" "}
+          <strong>Neptune Bulk Loader</strong>를 사용하여 고속 업로드합니다.
+          (JSON → CSV 변환 → S3 → Neptune Loader API)
+        </Alert>
+      ) : (
+        <Alert type="info">
+          아래 설정을 확인한 후 &quot;업로드 실행&quot; 버튼을 클릭하세요.
+          업로드가 시작되면 취소할 수 없습니다.
+        </Alert>
+      )}
 
       <Container header={<Header variant="h2">업로드 요약</Header>}>
         <ColumnLayout columns={2} variant="text-grid">
