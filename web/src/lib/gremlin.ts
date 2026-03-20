@@ -15,15 +15,46 @@ const NEPTUNE_REGION = process.env.AWS_REGION || "ap-northeast-2";
 let connection: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let g: any = null;
+let connectedAt = 0;
+
+// SigV4 signatures expire after 5 minutes; reconnect before that
+const MAX_CONNECTION_AGE_MS = 4 * 60 * 1000; // 4 min (with 1 min margin)
 
 /**
- * Returns a singleton Gremlin graph traversal source.
- * Signs the WebSocket handshake with SigV4 using EC2 instance IAM role.
+ * Reset connection so next getTraversal() creates a fresh one.
+ */
+export function resetConnection(): void {
+  try {
+    connection?.close();
+  } catch {
+    // ignore close errors
+  }
+  connection = null;
+  g = null;
+  connectedAt = 0;
+}
+
+/**
+ * Check if the connection is stale (SigV4 signature expired).
+ */
+function isConnectionStale(): boolean {
+  if (!connectedAt) return true;
+  return Date.now() - connectedAt > MAX_CONNECTION_AGE_MS;
+}
+
+/**
+ * Returns a Gremlin graph traversal source.
+ * Automatically reconnects when SigV4 signature expires.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function getTraversal(): Promise<any> {
-  if (g && connection) {
+  if (g && connection && !isConnectionStale()) {
     return g;
+  }
+
+  // Close stale connection
+  if (connection) {
+    resetConnection();
   }
 
   // 1. Get IAM credentials from instance role
@@ -58,18 +89,54 @@ export async function getTraversal(): Promise<any> {
     connection
   );
 
+  connectedAt = Date.now();
+
   return g;
+}
+
+/**
+ * Execute a Gremlin operation with automatic retry on auth errors.
+ * Resets connection on 403/signature expired and retries once.
+ */
+export async function withRetry<T>(
+  operation: (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    g: any
+  ) => Promise<T>
+): Promise<T> {
+  try {
+    const traversal = await getTraversal();
+    return await operation(traversal);
+  } catch (err: unknown) {
+    const errMsg = String(
+      (err as { statusMessage?: string }).statusMessage ||
+        (err as Error).message ||
+        ""
+    );
+    const statusCode = (err as { statusCode?: number }).statusCode;
+
+    // Retry on SigV4 expiry or auth failure
+    if (
+      statusCode === 403 ||
+      errMsg.includes("Signature expired") ||
+      errMsg.includes("AccessDenied") ||
+      errMsg.includes("security token")
+    ) {
+      console.warn("[Gremlin] Auth error detected, reconnecting:", errMsg.slice(0, 120));
+      resetConnection();
+      const traversal = await getTraversal();
+      return await operation(traversal);
+    }
+
+    throw err;
+  }
 }
 
 /**
  * Close the Gremlin connection (for graceful shutdown).
  */
 export async function closeConnection(): Promise<void> {
-  if (connection) {
-    await connection.close();
-    connection = null;
-    g = null;
-  }
+  resetConnection();
 }
 
 /**
