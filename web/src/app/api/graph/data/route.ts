@@ -25,10 +25,25 @@ export async function DELETE(request: Request) {
     const beforeNodes = Number(nodeCount.value);
     const beforeEdges = Number(edgeCount.value);
 
-    // Drop all edges first, then all vertices
-    // Neptune handles large deletes in batches internally
-    await g.E().drop().iterate();
-    await g.V().drop().iterate();
+    // Neptune doesn't support iterate() (discard operator).
+    // Delete in batches using limit + drop + next loop.
+    const BATCH = 500;
+
+    // Drop edges in batches
+    let hasMore = true;
+    while (hasMore) {
+      await g.E().limit(BATCH).drop().fold().next();
+      const remaining = await g.E().limit(1).count().next();
+      hasMore = Number(remaining.value) > 0;
+    }
+
+    // Drop vertices in batches
+    hasMore = true;
+    while (hasMore) {
+      await g.V().limit(BATCH).drop().fold().next();
+      const remaining = await g.V().limit(1).count().next();
+      hasMore = Number(remaining.value) > 0;
+    }
 
     // Invalidate all graph caches
     cacheInvalidate("graph:");
