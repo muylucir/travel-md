@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
-import { getTraversal } from "@/lib/gremlin";
+import gremlin from "gremlin";
+import { getTraversal, mapToObject } from "@/lib/gremlin";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import { valkeyGet, valkeySet, ValkeyTTL } from "@/lib/valkey";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const T = (gremlin.process as any).t;
 
 interface GraphStats {
   nodeCountByType: Record<string, number>;
@@ -30,28 +34,32 @@ export async function GET() {
 
     const g = await getTraversal();
 
-    // Node counts by label
-    const nodeCounts = await g.V().groupCount().by("~label").next();
+    // Node counts by label (T.label for Neptune Gremlin)
+    const nodeCounts = await g.V().groupCount().by(T.label).next();
     const nodeCountByType: Record<string, number> = {};
     let totalNodes = 0;
-    if (nodeCounts.value instanceof Map) {
-      for (const [label, count] of nodeCounts.value) {
-        const c = Number(count);
-        nodeCountByType[String(label)] = c;
-        totalNodes += c;
-      }
+    const nodeMap =
+      nodeCounts.value instanceof Map
+        ? nodeCounts.value
+        : new Map(Object.entries(mapToObject<Record<string, unknown>>(nodeCounts.value)));
+    for (const [label, count] of nodeMap) {
+      const c = Number(count);
+      nodeCountByType[String(label)] = c;
+      totalNodes += c;
     }
 
     // Edge counts by label
-    const edgeCounts = await g.E().groupCount().by("~label").next();
+    const edgeCounts = await g.E().groupCount().by(T.label).next();
     const edgeCountByLabel: Record<string, number> = {};
     let totalEdges = 0;
-    if (edgeCounts.value instanceof Map) {
-      for (const [label, count] of edgeCounts.value) {
-        const c = Number(count);
-        edgeCountByLabel[String(label)] = c;
-        totalEdges += c;
-      }
+    const edgeMap =
+      edgeCounts.value instanceof Map
+        ? edgeCounts.value
+        : new Map(Object.entries(mapToObject<Record<string, unknown>>(edgeCounts.value)));
+    for (const [label, count] of edgeMap) {
+      const c = Number(count);
+      edgeCountByLabel[String(label)] = c;
+      totalEdges += c;
     }
 
     const result: GraphStats = {
