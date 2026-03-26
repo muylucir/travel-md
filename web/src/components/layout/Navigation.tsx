@@ -61,6 +61,11 @@ export default function Navigation() {
               text: "그래프 업로드",
               href: "/graph/upload",
             },
+            {
+              type: "link",
+              text: "S3 → Graph 변환",
+              href: "/graph/etl",
+            },
           ],
         },
       ]}

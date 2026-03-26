@@ -1,0 +1,354 @@
+{
+  "$schema": "OTA Travel GraphRAG Schema",
+  "description": "Neptune Knowledge Graph schema for OTA Travel Agent — 12 vertex types, 19 edge types",
+  "database": "Amazon Neptune (Gremlin)",
+
+  "vertices": {
+    "Package": {
+      "description": "여행 패키지 상품 (그래프 허브 노드)",
+      "primaryKey": "code",
+      "properties": {
+        "code":                  { "type": "string",  "required": true,  "description": "상품 코드 (고유 ID)" },
+        "name":                  { "type": "string",  "required": true,  "description": "패키지 이름" },
+        "description":           { "type": "string",  "required": false, "description": "상품 설명" },
+        "price":                 { "type": "integer", "required": true,  "description": "성인 가격 (원)" },
+        "child_price":           { "type": "integer", "required": false, "description": "아동 가격 (원)" },
+        "infant_price":          { "type": "integer", "required": false, "description": "유아 가격 (원)" },
+        "nights":                { "type": "integer", "required": true,  "description": "숙박 수" },
+        "days":                  { "type": "integer", "required": true,  "description": "여행 일수" },
+        "rating":                { "type": "float",   "required": false, "description": "평점 (0~5)" },
+        "review_count":          { "type": "integer", "required": false, "description": "리뷰 수" },
+        "season":                { "type": "json",    "required": false, "description": "출발 가능 시즌 (JSON 배열)" },
+        "product_line":          { "type": "string",  "required": false, "description": "상품 라인 (예: 프리미엄)" },
+        "hashtags":              { "type": "json",    "required": false, "description": "해시태그 (JSON 배열)" },
+        "source_url":            { "type": "string",  "required": false, "description": "원본 URL" },
+        "shopping_count":        { "type": "integer", "required": false, "description": "쇼핑 횟수" },
+        "has_escort":            { "type": "boolean", "required": false, "description": "인솔자 동행 여부" },
+        "guide_fee":             { "type": "string",  "required": false, "description": "가이드 경비 안내 (JSON)" },
+        "meal_included":         { "type": "string",  "required": false, "description": "식사 포함 정보" },
+        "optional_tour":         { "type": "boolean", "required": false, "description": "선택 관광 포함 여부" },
+        "single_room_surcharge": { "type": "integer", "required": false, "description": "1인실 추가 요금" },
+        "deposit_per_person":    { "type": "integer", "required": false, "description": "1인당 예약금" },
+        "country":               { "type": "string",  "required": false, "description": "여행 국가" },
+        "region":                { "type": "string",  "required": false, "description": "여행 지역" },
+        "duration":              { "type": "string",  "required": false, "description": "여행 기간 문자열" },
+        "fuel_surcharge":        { "type": "string",  "required": false, "description": "유류 할증료" },
+        "highlights":            { "type": "string",  "required": false, "description": "주요 특징" },
+        "promotions":            { "type": "string",  "required": false, "description": "프로모션 정보" },
+        "product_tags":          { "type": "string",  "required": false, "description": "상품 태그" }
+      }
+    },
+
+    "City": {
+      "description": "여행 도시",
+      "primaryKey": "name",
+      "properties": {
+        "name":     { "type": "string", "required": true,  "description": "도시 이름" },
+        "country":  { "type": "string", "required": false, "description": "국가" },
+        "region":   { "type": "string", "required": false, "description": "지역 (예: 간토, 간사이)" },
+        "code":     { "type": "string", "required": false, "description": "도시 코드" },
+        "timezone": { "type": "string", "required": false, "description": "시간대" },
+        "voltage":  { "type": "string", "required": false, "description": "전압 (예: 100V)" },
+        "size":     { "type": "string", "required": false, "description": "도시 규모" }
+      }
+    },
+
+    "Attraction": {
+      "description": "관광지 / 명소",
+      "primaryKey": "name",
+      "properties": {
+        "name":            { "type": "string",  "required": true,  "description": "관광지 이름" },
+        "category":        { "type": "string",  "required": false, "description": "분류 (예: 자연, 사찰, 쇼핑)" },
+        "description":     { "type": "string",  "required": false, "description": "설명" },
+        "family_friendly": { "type": "boolean", "required": false, "description": "가족 친화 여부" },
+        "photo_worthy":    { "type": "boolean", "required": false, "description": "포토 스팟 여부" }
+      }
+    },
+
+    "Hotel": {
+      "description": "숙박 시설",
+      "primaryKey": "name (name_en 또는 name_ko)",
+      "properties": {
+        "name_ko":     { "type": "string",  "required": false, "description": "호텔 한글명" },
+        "name_en":     { "type": "string",  "required": true,  "description": "호텔 영문명 (ID)" },
+        "grade":       { "type": "string",  "required": false, "description": "등급 (예: 5성)" },
+        "room_type":   { "type": "string",  "required": false, "description": "객실 타입" },
+        "has_onsen":   { "type": "boolean", "required": false, "description": "온천 보유 여부" },
+        "amenities":   { "type": "string",  "required": false, "description": "부대시설" },
+        "description": { "type": "string",  "required": false, "description": "호텔 설명" },
+        "onsen_info":  { "type": "string",  "required": false, "description": "온천 상세 정보" }
+      }
+    },
+
+    "Route": {
+      "description": "항공편 (출발/귀국)",
+      "primaryKey": "flight_number",
+      "properties": {
+        "flight_number":  { "type": "string", "required": true,  "description": "편명 (예: OZ101)" },
+        "departure_time": { "type": "string", "required": false, "description": "출발 시간" },
+        "arrival_time":   { "type": "string", "required": false, "description": "도착 시간" },
+        "duration":       { "type": "string", "required": false, "description": "비행 시간" },
+        "date":           { "type": "string", "required": false, "description": "출발 날짜" },
+        "airline":        { "type": "string", "required": false, "description": "항공사 이름" },
+        "airline_type":   { "type": "string", "required": false, "description": "항공사 유형 (FSC/LCC)" }
+      }
+    },
+
+    "Theme": {
+      "description": "여행 테마 (예: 온천, 미식, 액티비티)",
+      "primaryKey": "name",
+      "properties": {
+        "name": { "type": "string", "required": true, "description": "테마 이름" }
+      }
+    },
+
+    "Region": {
+      "description": "지역 (예: 간토, 간사이, 큐슈)",
+      "primaryKey": "name",
+      "properties": {
+        "name":    { "type": "string", "required": true,  "description": "지역 이름" },
+        "country": { "type": "string", "required": false, "description": "국가" }
+      }
+    },
+
+    "Airline": {
+      "description": "항공사",
+      "primaryKey": "name",
+      "properties": {
+        "name": { "type": "string", "required": true,  "description": "항공사 이름" },
+        "type": { "type": "string", "required": false, "description": "유형 (FSC/LCC)" }
+      }
+    },
+
+    "Country": {
+      "description": "국가",
+      "primaryKey": "name",
+      "properties": {
+        "name": { "type": "string", "required": true, "description": "국가 이름" }
+      }
+    },
+
+    "Season": {
+      "description": "시즌 (봄/여름/가을/겨울)",
+      "primaryKey": "name",
+      "properties": {
+        "name": { "type": "string", "required": true, "description": "시즌 이름" }
+      }
+    },
+
+    "Trend": {
+      "description": "트렌드 (SNS/유튜브/뉴스 기반 여행 트렌드)",
+      "primaryKey": "title + source (복합키)",
+      "properties": {
+        "title":          { "type": "string",  "required": true,  "description": "트렌드 제목" },
+        "type":           { "type": "string",  "required": true,  "description": "트렌드 유형" },
+        "source":         { "type": "string",  "required": true,  "description": "출처 (youtube, news 등)" },
+        "date":           { "type": "string",  "required": false, "description": "트렌드 날짜 (ISO)" },
+        "virality_score": { "type": "integer", "required": true,  "description": "바이럴 점수 (0~100)" },
+        "decay_rate":     { "type": "float",   "required": true,  "description": "감쇠율 (0.0~1.0)" },
+        "keywords":       { "type": "json",    "required": false, "description": "키워드 (JSON 배열)" },
+        "evidence":       { "type": "json",    "required": false, "description": "근거 자료 (JSON 배열)" },
+        "tier":           { "type": "string",  "required": false, "description": "등급: hot (≤0.10), steady (≤0.25), seasonal (>0.25)" },
+        "updated_at":     { "type": "string",  "required": false, "description": "마지막 업데이트 (ISO)" }
+      }
+    },
+
+    "TrendSpot": {
+      "description": "트렌드 장소 (트렌드에 언급된 특정 장소)",
+      "primaryKey": "name",
+      "properties": {
+        "name":         { "type": "string",  "required": true,  "description": "장소 이름" },
+        "description":  { "type": "string",  "required": false, "description": "장소 설명" },
+        "category":     { "type": "string",  "required": false, "description": "장소 분류" },
+        "lat":          { "type": "float",   "required": false, "description": "위도" },
+        "lng":          { "type": "float",   "required": false, "description": "경도" },
+        "photo_worthy": { "type": "boolean", "required": false, "description": "포토 스팟 여부" },
+        "updated_at":   { "type": "string",  "required": false, "description": "마지막 업데이트 (ISO)" }
+      }
+    }
+  },
+
+  "edges": {
+    "VISITS": {
+      "description": "패키지가 방문하는 도시",
+      "from": "Package",
+      "to": "City",
+      "properties": {
+        "day":    { "type": "integer", "description": "방문 일차" },
+        "order":  { "type": "integer", "description": "방문 순서" },
+        "layer":  { "type": "integer", "description": "5-Layer 레이어 (fallback)" },
+        "weight": { "type": "float",   "description": "5-Layer 가중치 (fallback)" }
+      }
+    },
+
+    "INCLUDES": {
+      "description": "패키지에 포함된 관광지",
+      "from": "Package",
+      "to": "Attraction",
+      "properties": {
+        "day":    { "type": "integer", "description": "포함 일차" },
+        "order":  { "type": "integer", "description": "관광 순서" },
+        "layer":  { "type": "integer", "description": "5-Layer 레이어 (L3=0.50)" },
+        "weight": { "type": "float",   "description": "5-Layer 가중치" }
+      }
+    },
+
+    "INCLUDES_HOTEL": {
+      "description": "패키지에 포함된 숙소",
+      "from": "Package",
+      "to": "Hotel",
+      "properties": {
+        "layer":  { "type": "integer", "description": "5-Layer 레이어 (L2)" },
+        "weight": { "type": "float",   "description": "5-Layer 가중치 (0.70)" }
+      }
+    },
+
+    "DEPARTS_ON": {
+      "description": "패키지의 항공편 (출발/귀국)",
+      "from": "Package",
+      "to": "Route",
+      "properties": {
+        "type": { "type": "string", "description": "outbound (출발) / return (귀국)" }
+      }
+    },
+
+    "TAGGED": {
+      "description": "패키지에 연결된 테마",
+      "from": "Package",
+      "to": "Theme",
+      "properties": {
+        "layer":  { "type": "integer", "description": "5-Layer 레이어 (L5)" },
+        "weight": { "type": "float",   "description": "5-Layer 가중치 (0.10)" }
+      }
+    },
+
+    "HAS_ACTIVITY": {
+      "description": "패키지에 포함된 액티비티",
+      "from": "Package",
+      "to": "Attraction",
+      "properties": {
+        "day": { "type": "integer", "description": "액티비티 일차" }
+      }
+    },
+
+    "USES": {
+      "description": "패키지가 이용하는 항공사",
+      "from": "Package",
+      "to": "Airline",
+      "properties": {}
+    },
+
+    "IN_COUNTRY": {
+      "description": "패키지의 여행 국가",
+      "from": "Package",
+      "to": "Country",
+      "properties": {}
+    },
+
+    "SIMILAR_TO": {
+      "description": "패키지 간 유사도 (자카드 유사도 ≥ 0.30, 공유 City 기반)",
+      "from": "Package",
+      "to": "Package",
+      "properties": {
+        "score": { "type": "float", "description": "자카드 유사도 계수 (0.30~1.00)" }
+      }
+    },
+
+    "POPULAR_IN": {
+      "description": "패키지의 인기 시즌",
+      "from": "Package",
+      "to": "Season",
+      "properties": {}
+    },
+
+    "HAS_ATTRACTION": {
+      "description": "도시에 있는 관광지",
+      "from": "City",
+      "to": "Attraction",
+      "properties": {}
+    },
+
+    "HAS_HOTEL": {
+      "description": "도시에 있는 숙소",
+      "from": "City",
+      "to": "Hotel",
+      "properties": {}
+    },
+
+    "NEAR": {
+      "description": "인접 도시 (같은 지역)",
+      "from": "City",
+      "to": "City",
+      "properties": {
+        "same_region":  { "type": "boolean", "description": "같은 지역 여부" },
+        "distance_km":  { "type": "float",   "description": "거리 (km)" }
+      }
+    },
+
+    "IN_REGION": {
+      "description": "도시가 속한 지역",
+      "from": "City",
+      "to": "Region",
+      "properties": {}
+    },
+
+    "BELONGS_TO": {
+      "description": "지역이 속한 국가",
+      "from": "Region",
+      "to": "Country",
+      "properties": {}
+    },
+
+    "TO": {
+      "description": "항공편 도착 도시",
+      "from": "Route",
+      "to": "City",
+      "properties": {}
+    },
+
+    "OPERATES": {
+      "description": "항공편 운항 항공사",
+      "from": "Route",
+      "to": "Airline",
+      "properties": {}
+    },
+
+    "FILMED_AT": {
+      "description": "트렌드가 촬영된 장소",
+      "from": "Trend",
+      "to": "TrendSpot",
+      "properties": {}
+    },
+
+    "FEATURES": {
+      "description": "트렌드에서 다뤄진 장소",
+      "from": "Trend",
+      "to": "TrendSpot",
+      "properties": {}
+    },
+
+    "LOCATED_IN": {
+      "description": "트렌드 장소가 위치한 도시",
+      "from": "TrendSpot",
+      "to": "City",
+      "properties": {}
+    }
+  },
+
+  "metadata": {
+    "vertexCount": 12,
+    "edgeCount": 20,
+    "hubNode": "Package",
+    "graphPattern": "Hub-and-Spoke (Package 중심)",
+    "upsertPattern": "fold/coalesce/unfold (멱등성 보장)",
+    "similarityAlgorithm": "Jaccard coefficient (공유 City 기반, threshold ≥ 0.30)",
+    "trendScoring": "effective_score = virality_score × (1 - decay_rate) ^ months_elapsed",
+    "5LayerSystem": {
+      "L1_Route":     { "weight": 0.95, "description": "항공편 (가장 높은 우선순위)" },
+      "L2_Hotel":     { "weight": 0.70, "description": "숙소" },
+      "L3_Attraction":{ "weight": 0.50, "description": "관광지" },
+      "L4_Activity":  { "weight": 0.30, "description": "액티비티" },
+      "L5_Theme":     { "weight": 0.10, "description": "테마 (가장 낮은 우선순위)" }
+    }
+  }
+}
