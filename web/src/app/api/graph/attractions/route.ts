@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { AttractionNode } from "@/lib/types";
 
@@ -28,35 +28,27 @@ export async function GET(request: NextRequest) {
     const cached = cacheGet<AttractionNode[]>(cacheKey);
     if (cached) return NextResponse.json(cached);
 
-    const g = await getTraversal();
-    let traversal = g
-      .V()
-      .hasLabel("City")
-      .has("name", city)
-      .out("HAS_ATTRACTION")
-      .hasLabel("Attraction");
+    const params: Record<string, unknown> = { city };
+    let categoryFilter = "";
 
     if (category) {
-      traversal = traversal.has("category", category);
+      categoryFilter = " AND a.category = $category";
+      params.category = category;
     }
 
-    const results = await traversal
-      .dedup()
-      .valueMap(true)
-      .toList();
+    const results = await executeQuery(
+      `MATCH (:City {name: $city})-[:HAS_ATTRACTION]->(a:Attraction) WHERE true${categoryFilter} RETURN DISTINCT a`,
+      params
+    );
 
-    const attractions: AttractionNode[] = results.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(r as Map<string, unknown>);
-      const val = (key: string) => {
-        const v = obj[key];
-        return Array.isArray(v) ? v[0] : v;
-      };
+    const attractions: AttractionNode[] = results.map((row) => {
+      const obj = extractNode(row as Record<string, unknown>, "a");
       return {
-        name: String(val("name") || ""),
-        category: String(val("category") || ""),
-        description: val("description") as string | undefined,
-        family_friendly: Boolean(val("family_friendly")),
-        photo_worthy: Boolean(val("photo_worthy")),
+        name: String(obj.name || ""),
+        category: String(obj.category || ""),
+        description: obj.description as string | undefined,
+        family_friendly: Boolean(obj.family_friendly),
+        photo_worthy: Boolean(obj.photo_worthy),
       };
     });
 

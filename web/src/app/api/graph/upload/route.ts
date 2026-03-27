@@ -1,11 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import gremlin from "gremlin";
-import { getTraversal } from "@/lib/gremlin";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const { t: T, cardinality } = gremlin.process as any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const __ = gremlin.process.statics as any;
+import { executeQuery } from "@/lib/neptune";
 
 interface PropertyMapping {
   jsonField: string;
@@ -39,7 +33,7 @@ interface UploadRequest {
 
 /**
  * POST /api/graph/upload
- * Bulk upload nodes and edges to Neptune graph DB.
+ * Bulk upload nodes and edges to Neptune graph DB using OpenCypher.
  */
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
@@ -65,7 +59,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const g = await getTraversal();
+    // Validate label (prevent injection since labels can't be parameterized)
+    if (!/^[A-Za-z0-9_]+$/.test(nodeDesign.nodeLabel)) {
+      return NextResponse.json(
+        { error: "유효하지 않은 노드 라벨입니다." },
+        { status: 400 }
+      );
+    }
 
     // Cache for target vertex lookups: "Label:value" → vertexId
     const targetCache = new Map<string, string | null>();
@@ -86,68 +86,56 @@ export async function POST(request: NextRequest) {
         const vertexId = `${nodeDesign.nodeLabel}:${idValue}`;
 
         // 2. Check existence
-        const exists = await g.V(vertexId).hasNext();
+        const [existsRow] = await executeQuery<{ exists: boolean }>(
+          "MATCH (n) WHERE id(n) = $vertexId RETURN count(n) > 0 AS exists",
+          { vertexId }
+        );
+        const exists = existsRow?.exists ?? false;
 
         if (exists && duplicateStrategy === "skip") {
           result.nodesSkipped++;
-          // Still process edges for existing nodes
-          await processEdges(
-            g,
-            vertexId,
-            item,
-            edgeMappings,
-            targetCache,
-            result
-          );
+          await processEdges(vertexId, item, edgeMappings, targetCache, result);
           continue;
         }
 
-        // 3. Build property list
-        const properties: Array<{ key: string; value: unknown }> = [];
+        // 3. Build property SET clause
+        const props: Record<string, unknown> = {};
         for (const mapping of nodeDesign.propertyMappings) {
           if (!mapping.include) continue;
           const value = item[mapping.jsonField];
           if (value === null || value === undefined) continue;
-          // Neptune stores primitives; stringify objects
-          const storeValue =
+          props[mapping.nodeProperty] =
             typeof value === "object" ? JSON.stringify(value) : value;
-          properties.push({ key: mapping.nodeProperty, value: storeValue });
         }
 
         // 4. Create or update vertex
         if (exists && duplicateStrategy === "update") {
-          // Update existing vertex properties
-          let traversal = g.V(vertexId);
-          for (const prop of properties) {
-            traversal = traversal.property(
-              cardinality.single,
-              prop.key,
-              prop.value
+          // Build SET clauses dynamically
+          const setClauses = Object.keys(props)
+            .map((k) => `n.\`${k}\` = $props.\`${k}\``)
+            .join(", ");
+          if (setClauses) {
+            await executeQuery(
+              `MATCH (n) WHERE id(n) = $vertexId SET ${setClauses}`,
+              { vertexId, props }
             );
           }
-          await traversal.next();
           result.nodesUpdated++;
         } else {
-          // Create new vertex
-          let traversal = g
-            .addV(nodeDesign.nodeLabel)
-            .property(T.id, vertexId);
-          for (const prop of properties) {
-            traversal = traversal.property(prop.key, prop.value);
-          }
-          await traversal.next();
+          // Create new vertex with custom ID using MERGE
+          const setClauses = Object.keys(props)
+            .map((k) => `n.\`${k}\` = $props.\`${k}\``)
+            .join(", ");
+          const setStr = setClauses ? `SET ${setClauses}` : "";
+          await executeQuery(
+            `CREATE (n:${nodeDesign.nodeLabel} {\`~id\`: $vertexId}) ${setStr}`,
+            { vertexId, props }
+          );
           result.nodesCreated++;
         }
 
         // 5. Process edge mappings
-        await processEdges(
-          g,
-          vertexId,
-          item,
-          edgeMappings,
-          targetCache,
-          result
-        );
+        await processEdges(vertexId, item, edgeMappings, targetCache, result);
       } catch (err) {
         const msg =
           err instanceof Error ? err.message : "알 수 없는 오류";
@@ -172,8 +160,6 @@ export async function POST(request: NextRequest) {
 }
 
 async function processEdges(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  g: any,
   sourceVertexId: string,
   item: Record<string, unknown>,
   edgeMappings: EdgeMappingRule[],
@@ -187,11 +173,14 @@ async function processEdges(
 ) {
   for (const rule of edgeMappings) {
     try {
+      // Validate edge label
+      if (!/^[A-Za-z0-9_]+$/.test(rule.edgeLabel)) continue;
+      if (!/^[A-Za-z0-9_]+$/.test(rule.targetNodeLabel)) continue;
+
       const rawValue = item[rule.sourceField];
       if (rawValue === null || rawValue === undefined || rawValue === "")
         continue;
 
-      // Handle array values (create edge for each)
       const values = Array.isArray(rawValue)
         ? rawValue.map(String)
         : [String(rawValue)];
@@ -204,23 +193,19 @@ async function processEdges(
 
         // Look up target if not cached
         if (targetId === undefined) {
-          const targets = await g
-            .V()
-            .hasLabel(rule.targetNodeLabel)
-            .has(rule.targetMatchProperty, value)
-            .id()
-            .toList();
+          const targets = await executeQuery<{ tid: string }>(
+            `MATCH (t:${rule.targetNodeLabel}) WHERE t.\`${rule.targetMatchProperty}\` = $value RETURN id(t) AS tid`,
+            { value }
+          );
 
           if (targets.length > 0) {
-            targetId = String(targets[0]);
+            targetId = String(targets[0].tid);
           } else if (rule.autoCreateTarget) {
-            // Auto-create target node
             const newTargetId = cacheKey;
-            await g
-              .addV(rule.targetNodeLabel)
-              .property(T.id, newTargetId)
-              .property(rule.targetMatchProperty, value)
-              .next();
+            await executeQuery(
+              `CREATE (t:${rule.targetNodeLabel} {\`~id\`: $tid, \`${rule.targetMatchProperty}\`: $value})`,
+              { tid: newTargetId, value }
+            );
             targetId = newTargetId;
             result.targetNodesCreated++;
           } else {
@@ -235,40 +220,25 @@ async function processEdges(
         }
 
         // Check if edge already exists
-        let edgeExists: boolean;
-        if (rule.direction === "out") {
-          edgeExists = await g
-            .V(sourceVertexId)
-            .outE(rule.edgeLabel)
-            .where(__.inV().hasId(targetId))
-            .hasNext();
-        } else {
-          edgeExists = await g
-            .V(targetId)
-            .outE(rule.edgeLabel)
-            .where(__.inV().hasId(sourceVertexId))
-            .hasNext();
-        }
+        const [edgeCheck] = await executeQuery<{ exists: boolean }>(
+          rule.direction === "out"
+            ? `MATCH (a)-[r:${rule.edgeLabel}]->(b) WHERE id(a) = $src AND id(b) = $tgt RETURN count(r) > 0 AS exists`
+            : `MATCH (a)-[r:${rule.edgeLabel}]->(b) WHERE id(a) = $tgt AND id(b) = $src RETURN count(r) > 0 AS exists`,
+          { src: sourceVertexId, tgt: targetId }
+        );
 
-        if (edgeExists) {
+        if (edgeCheck?.exists) {
           result.edgesSkipped++;
           continue;
         }
 
         // Create edge
-        if (rule.direction === "out") {
-          await g
-            .V(sourceVertexId)
-            .addE(rule.edgeLabel)
-            .to(__.V(targetId))
-            .next();
-        } else {
-          await g
-            .V(targetId)
-            .addE(rule.edgeLabel)
-            .to(__.V(sourceVertexId))
-            .next();
-        }
+        await executeQuery(
+          rule.direction === "out"
+            ? `MATCH (a), (b) WHERE id(a) = $src AND id(b) = $tgt CREATE (a)-[:${rule.edgeLabel}]->(b)`
+            : `MATCH (a), (b) WHERE id(a) = $tgt AND id(b) = $src CREATE (a)-[:${rule.edgeLabel}]->(b)`,
+          { src: sourceVertexId, tgt: targetId }
+        );
         result.edgesCreated++;
       }
     } catch (err) {

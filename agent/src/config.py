@@ -3,10 +3,10 @@
 import os
 
 
-# Neptune / Gremlin
-GREMLIN_ENDPOINT: str = os.getenv(
-    "GREMLIN_ENDPOINT",
-    "wss://REDACTED_NEPTUNE_HOST:8182/gremlin",
+# Neptune OpenCypher (HTTPS)
+NEPTUNE_ENDPOINT: str = os.getenv(
+    "NEPTUNE_ENDPOINT",
+    "https://REDACTED_NEPTUNE_HOST:8182",
 )
 
 # ElastiCache / Valkey (Redis-compatible)

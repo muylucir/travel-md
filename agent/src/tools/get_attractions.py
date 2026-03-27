@@ -5,11 +5,9 @@ from __future__ import annotations
 import json
 import logging
 
-from gremlin_python.process.graph_traversal import __
-
 from strands import tool
 
-from src.tools.graph_client import get_connection, map_to_dict
+from src.tools.graph_client import execute_query, extract_node
 
 logger = logging.getLogger(__name__)
 
@@ -25,20 +23,14 @@ def get_attractions_by_city(city: str, category: str = "") -> str:
         city: City name, e.g. '다케오', '오사카'.
         category: Optional attraction category, e.g. '신사', '자연', '문화'.
     """
-    g = get_connection()
-
-    t = (
-        g.V()
-        .hasLabel("City")
-        .has("name", city)
-        .out("HAS_ATTRACTION")
-        .hasLabel("Attraction")
-    )
-
     if category:
-        t = t.has("category", category)
+        query = "MATCH (:City {name: $city})-[:HAS_ATTRACTION]->(a:Attraction {category: $category}) RETURN a"
+        params = {"city": city, "category": category}
+    else:
+        query = "MATCH (:City {name: $city})-[:HAS_ATTRACTION]->(a:Attraction) RETURN a"
+        params = {"city": city}
 
-    results = t.valueMap(True).toList()
-    attractions = [map_to_dict(a) for a in results]
+    rows = execute_query(query, params)
+    attractions = [extract_node(row, "a") for row in rows]
 
     return json.dumps({"attractions": attractions, "count": len(attractions)}, ensure_ascii=False, default=str)

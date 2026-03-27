@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 
 /**
@@ -18,15 +18,11 @@ export async function GET(
     const cached = cacheGet<Record<string, unknown>>(cacheKey);
     if (cached) return NextResponse.json(cached);
 
-    const g = await getTraversal();
-
     // Fetch package node
-    const packageResults = await g
-      .V()
-      .hasLabel("Package")
-      .has("code", code)
-      .valueMap(true)
-      .toList();
+    const packageResults = await executeQuery(
+      "MATCH (p:Package {code: $code}) RETURN p",
+      { code }
+    );
 
     if (packageResults.length === 0) {
       return NextResponse.json(
@@ -35,83 +31,51 @@ export async function GET(
       );
     }
 
-    const pkg = mapToObject<Record<string, unknown>>(
-      packageResults[0] as Map<string, unknown>
-    );
+    const pkg = extractNode(packageResults[0] as Record<string, unknown>, "p");
 
     // Fetch related cities
-    const cityResults = await g
-      .V()
-      .hasLabel("Package")
-      .has("code", code)
-      .out("VISITS")
-      .hasLabel("City")
-      .dedup()
-      .valueMap(true)
-      .toList();
-
-    const cities = cityResults.map((r: unknown) =>
-      mapToObject(r as Map<string, unknown>)
+    const cityResults = await executeQuery(
+      "MATCH (:Package {code: $code})-[:VISITS]->(c:City) RETURN DISTINCT c",
+      { code }
+    );
+    const cities = cityResults.map((row) =>
+      extractNode(row as Record<string, unknown>, "c")
     );
 
     // Fetch related attractions
-    const attractionResults = await g
-      .V()
-      .hasLabel("Package")
-      .has("code", code)
-      .out("INCLUDES")
-      .hasLabel("Attraction")
-      .dedup()
-      .valueMap(true)
-      .toList();
-
-    const attractions = attractionResults.map((r: unknown) =>
-      mapToObject(r as Map<string, unknown>)
+    const attractionResults = await executeQuery(
+      "MATCH (:Package {code: $code})-[:INCLUDES]->(a:Attraction) RETURN DISTINCT a",
+      { code }
+    );
+    const attractions = attractionResults.map((row) =>
+      extractNode(row as Record<string, unknown>, "a")
     );
 
     // Fetch related hotels
-    const hotelResults = await g
-      .V()
-      .hasLabel("Package")
-      .has("code", code)
-      .out("INCLUDES_HOTEL", "STAYS_AT")
-      .hasLabel("Hotel")
-      .dedup()
-      .valueMap(true)
-      .toList();
-
-    const hotels = hotelResults.map((r: unknown) =>
-      mapToObject(r as Map<string, unknown>)
+    const hotelResults = await executeQuery(
+      "MATCH (:Package {code: $code})-[:INCLUDES_HOTEL|STAYS_AT]->(h:Hotel) RETURN DISTINCT h",
+      { code }
+    );
+    const hotels = hotelResults.map((row) =>
+      extractNode(row as Record<string, unknown>, "h")
     );
 
     // Fetch related routes (flights)
-    const routeResults = await g
-      .V()
-      .hasLabel("Package")
-      .has("code", code)
-      .out("DEPARTS_ON")
-      .hasLabel("Route")
-      .dedup()
-      .valueMap(true)
-      .toList();
-
-    const routes = routeResults.map((r: unknown) =>
-      mapToObject(r as Map<string, unknown>)
+    const routeResults = await executeQuery(
+      "MATCH (:Package {code: $code})-[:DEPARTS_ON]->(r:Route) RETURN DISTINCT r",
+      { code }
+    );
+    const routes = routeResults.map((row) =>
+      extractNode(row as Record<string, unknown>, "r")
     );
 
     // Fetch themes
-    const themeResults = await g
-      .V()
-      .hasLabel("Package")
-      .has("code", code)
-      .out("TAGGED", "HAS_THEME")
-      .hasLabel("Theme")
-      .dedup()
-      .valueMap(true)
-      .toList();
-
-    const themes = themeResults.map((r: unknown) =>
-      mapToObject(r as Map<string, unknown>)
+    const themeResults = await executeQuery(
+      "MATCH (:Package {code: $code})-[:TAGGED|HAS_THEME]->(t:Theme) RETURN DISTINCT t",
+      { code }
+    );
+    const themes = themeResults.map((row) =>
+      extractNode(row as Record<string, unknown>, "t")
     );
 
     const result = { package: pkg, cities, attractions, hotels, routes, themes };

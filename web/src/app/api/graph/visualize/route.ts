@@ -1,12 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode, toGraphNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import { valkeyGet, valkeySet, ValkeyTTL } from "@/lib/valkey";
-import gremlin from "gremlin";
 import type { GraphData } from "@/lib/types";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const __ = gremlin.process.statics as any;
 
 /**
  * GET /api/graph/visualize
@@ -39,77 +35,62 @@ export async function GET(request: NextRequest) {
       return NextResponse.json(l2);
     }
 
-    const g = await getTraversal();
-
     // 1. Fetch vertices
-    let vertexTraversal = g.V();
+    let vertexQuery = "MATCH (n)";
+    const params: Record<string, unknown> = {};
     if (types.length > 0) {
-      vertexTraversal = vertexTraversal.hasLabel(...types);
-    }
-
-    if (nodeLimit > 0) {
-      vertexTraversal = vertexTraversal.limit(nodeLimit);
-    }
-    const vertices = await vertexTraversal.valueMap(true).toList();
-
-    const nodes = vertices.map((v: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(
-        v as Map<string, unknown>
-      );
-      const id = String(obj.id ?? obj["T.id"] ?? "");
-      const label = extractValue(obj, "name") ?? extractValue(obj, "code") ?? id;
-      const type = String(obj.label ?? obj["T.label"] ?? "unknown");
-
-      const properties: Record<string, unknown> = {};
-      for (const [key, val] of Object.entries(obj)) {
-        if (key !== "id" && key !== "label" && key !== "T.id" && key !== "T.label") {
-          properties[key] = Array.isArray(val) && val.length === 1 ? val[0] : val;
-        }
+      // Validate labels (alphanumeric + underscore only)
+      const safeTypes = types.filter((t) => /^[A-Za-z0-9_]+$/.test(t));
+      if (safeTypes.length > 0) {
+        vertexQuery += ` WHERE labels(n)[0] IN $types`;
+        params.types = safeTypes;
       }
+    }
+    vertexQuery += " RETURN n, id(n) AS nodeId";
+    if (nodeLimit > 0) {
+      vertexQuery += ` LIMIT ${nodeLimit}`;
+    }
 
-      return { id, label: String(label), type, properties };
+    const vertexRows = await executeQuery(vertexQuery, params);
+
+    const nodes = vertexRows.map((row) => {
+      const r = row as Record<string, unknown>;
+      const props = extractNode(r, "n");
+      // Ensure id from the query result
+      if (!props.id && r.nodeId) props.id = r.nodeId;
+      return toGraphNode(props);
     });
 
     // Build set of valid node IDs for edge filtering
-    const nodeIdSet = new Set(nodes.map((n: { id: string }) => n.id));
+    const nodeIdSet = new Set(nodes.map((n) => n.id));
     const nodeIds = Array.from(nodeIdSet);
 
-    // 2. Fetch edges between these vertices using project() for reliable extraction
+    // 2. Fetch edges between these vertices
     let edges: Array<{ id: string; source: string; target: string; label: string }> = [];
     if (nodeIds.length > 0) {
-      const batchSize = 200;
-      for (let i = 0; i < nodeIds.length; i += batchSize) {
-        const batch = nodeIds.slice(i, i + batchSize);
-        const edgeResults = await g
-          .V(...batch)
-          .bothE()
-          .where(__.otherV().hasId(...nodeIds))
-          .dedup()
-          .project("id", "label", "source", "target")
-          .by(__.id())
-          .by(__.label())
-          .by(__.outV().id())
-          .by(__.inV().id())
-          .toList();
+      const edgeRows = await executeQuery(
+        "MATCH (a)-[r]->(b) " +
+        "WHERE id(a) IN $ids AND id(b) IN $ids " +
+        "RETURN DISTINCT id(r) AS eid, type(r) AS label, " +
+        "id(startNode(r)) AS source, id(endNode(r)) AS target",
+        { ids: nodeIds }
+      );
 
-        for (const e of edgeResults) {
-          const obj = mapToObject<Record<string, unknown>>(
-            e as Map<string, unknown>
-          );
-          const edgeId = String(obj.id ?? "");
-          const edgeLabel = String(obj.label ?? "");
-          const source = String(obj.source ?? "");
-          const target = String(obj.target ?? "");
+      for (const row of edgeRows) {
+        const r = row as Record<string, unknown>;
+        const edgeId = String(r.eid ?? "");
+        const edgeLabel = String(r.label ?? "");
+        const source = String(r.source ?? "");
+        const target = String(r.target ?? "");
 
-          if (source && target && nodeIdSet.has(source) && nodeIdSet.has(target)) {
-            edges.push({ id: edgeId, source, target, label: edgeLabel });
-          }
+        if (source && target && nodeIdSet.has(source) && nodeIdSet.has(target)) {
+          edges.push({ id: edgeId, source, target, label: edgeLabel });
         }
       }
     }
 
     // Deduplicate edges
-    const edgeMap = new Map<string, typeof edges[0]>();
+    const edgeMap = new Map<string, (typeof edges)[0]>();
     for (const e of edges) {
       const key = `${e.source}-${e.label}-${e.target}`;
       if (!edgeMap.has(key)) {
@@ -138,13 +119,4 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-function extractValue(
-  obj: Record<string, unknown>,
-  key: string
-): string | undefined {
-  const v = obj[key];
-  if (v === undefined || v === null) return undefined;
-  return String(Array.isArray(v) ? v[0] : v);
 }

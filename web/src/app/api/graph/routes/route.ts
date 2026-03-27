@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { RouteNode } from "@/lib/types";
 
@@ -19,41 +19,30 @@ export async function GET(request: NextRequest) {
     const cached = cacheGet<RouteNode[]>(cacheKey);
     if (cached) return NextResponse.json(cached);
 
-    const g = await getTraversal();
+    let query: string;
+    let params: Record<string, unknown> | undefined;
 
-    let traversal;
     if (region) {
-      // Find routes that connect to cities in the given region
-      traversal = g
-        .V()
-        .hasLabel("City")
-        .has("region", region)
-        .inE("TO")
-        .outV()
-        .hasLabel("Route")
-        .dedup();
+      query = "MATCH (r:Route)-[:TO]->(c:City {region: $region}) RETURN DISTINCT r";
+      params = { region };
     } else {
-      traversal = g.V().hasLabel("Route");
+      query = "MATCH (r:Route) RETURN r";
     }
 
-    const results = await traversal.valueMap(true).toList();
+    const results = await executeQuery(query, params);
 
-    const routes: RouteNode[] = results.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(r as Map<string, unknown>);
-      const val = (key: string) => {
-        const v = obj[key];
-        return Array.isArray(v) ? v[0] : v;
-      };
+    const routes: RouteNode[] = results.map((row) => {
+      const obj = extractNode(row as Record<string, unknown>, "r");
       return {
-        id: String(val("id") || ""),
-        departure_city: String(val("departure_city") || ""),
-        arrival_city: String(val("arrival_city") || ""),
-        airline: String(val("airline") || ""),
-        airline_type: String(val("airline_type") || ""),
-        flight_number: String(val("flight_number") || ""),
-        departure_time: String(val("departure_time") || ""),
-        arrival_time: String(val("arrival_time") || ""),
-        duration: String(val("duration") || ""),
+        id: String(obj.id || ""),
+        departure_city: String(obj.departure_city || ""),
+        arrival_city: String(obj.arrival_city || ""),
+        airline: String(obj.airline || ""),
+        airline_type: String(obj.airline_type || ""),
+        flight_number: String(obj.flight_number || ""),
+        departure_time: String(obj.departure_time || ""),
+        arrival_time: String(obj.arrival_time || ""),
+        duration: String(obj.duration || ""),
       };
     });
 

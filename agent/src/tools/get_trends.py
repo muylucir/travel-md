@@ -6,12 +6,9 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from gremlin_python.process.graph_traversal import __
-from gremlin_python.process.traversal import P, Order
-
 from strands import tool
 
-from src.tools.graph_client import get_connection, map_to_dict, parse_json_field
+from src.tools.graph_client import execute_query, extract_node, parse_json_field
 
 logger = logging.getLogger(__name__)
 
@@ -50,37 +47,18 @@ def get_trends(region: str, min_score: int = 30) -> str:
         region: Region name to search for trends, e.g. '규슈', '간사이'.
         min_score: Minimum effective score after time decay (default 30).
     """
-    g = get_connection()
-
-    # Fetch Trend nodes connected to TrendSpots in the target region
-    raw = (
-        g.V()
-        .hasLabel("Trend")
-        .has("virality_score", P.gte(min_score))
-        .where(
-            __.out("FILMED_AT", "FEATURES")
-            .out("LOCATED_IN")
-            .hasLabel("City")
-            .has("region", region)
-        )
-        .project("trend", "spots")
-        .by(__.valueMap(True))
-        .by(
-            __.out("FILMED_AT", "FEATURES")
-            .where(
-                __.out("LOCATED_IN")
-                .hasLabel("City")
-                .has("region", region)
-            )
-            .valueMap(True)
-            .fold()
-        )
-        .toList()
+    rows = execute_query(
+        "MATCH (t:Trend)-[rel:FILMED_AT|FEATURES]->(ts:TrendSpot)"
+        "-[:LOCATED_IN]->(c:City {region: $region}) "
+        "WHERE t.virality_score >= $min_score "
+        "WITH t, collect(DISTINCT ts) AS spots "
+        "RETURN t, spots",
+        {"region": region, "min_score": min_score},
     )
 
     trends = []
-    for item in raw:
-        trend_data = map_to_dict(item["trend"])
+    for item in rows:
+        trend_data = extract_node(item, "t")
         for field in ("keywords",):
             if field in trend_data:
                 trend_data[field] = parse_json_field(trend_data[field])
@@ -98,7 +76,8 @@ def get_trends(region: str, min_score: int = 30) -> str:
         if effective < min_score:
             continue
 
-        spots = [map_to_dict(s) for s in item.get("spots", [])]
+        spots_raw = item.get("spots", [])
+        spots = [extract_node({"s": s}, "s") for s in spots_raw] if spots_raw else []
 
         tier = trend_data.get("tier") or _infer_tier(float(decay) if decay else 0.1)
         trends.append({

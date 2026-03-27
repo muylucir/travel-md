@@ -1,11 +1,7 @@
 import { NextResponse } from "next/server";
-import gremlin from "gremlin";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import { valkeyGet, valkeySet, ValkeyTTL } from "@/lib/valkey";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const T = (gremlin.process as any).t;
 
 interface GraphStats {
   nodeCountByType: Record<string, number>;
@@ -32,33 +28,27 @@ export async function GET() {
       return NextResponse.json(l2);
     }
 
-    const g = await getTraversal();
-
-    // Node counts by label (T.label for Neptune Gremlin)
-    const nodeCounts = await g.V().groupCount().by(T.label).next();
+    // Node counts by label
+    const nodeRows = await executeQuery<{ label: string; cnt: number }>(
+      "MATCH (n) RETURN labels(n)[0] AS label, count(n) AS cnt"
+    );
     const nodeCountByType: Record<string, number> = {};
     let totalNodes = 0;
-    const nodeMap =
-      nodeCounts.value instanceof Map
-        ? nodeCounts.value
-        : new Map(Object.entries(mapToObject<Record<string, unknown>>(nodeCounts.value)));
-    for (const [label, count] of nodeMap) {
-      const c = Number(count);
-      nodeCountByType[String(label)] = c;
+    for (const row of nodeRows) {
+      const c = Number(row.cnt);
+      nodeCountByType[String(row.label)] = c;
       totalNodes += c;
     }
 
     // Edge counts by label
-    const edgeCounts = await g.E().groupCount().by(T.label).next();
+    const edgeRows = await executeQuery<{ label: string; cnt: number }>(
+      "MATCH ()-[r]->() RETURN type(r) AS label, count(r) AS cnt"
+    );
     const edgeCountByLabel: Record<string, number> = {};
     let totalEdges = 0;
-    const edgeMap =
-      edgeCounts.value instanceof Map
-        ? edgeCounts.value
-        : new Map(Object.entries(mapToObject<Record<string, unknown>>(edgeCounts.value)));
-    for (const [label, count] of edgeMap) {
-      const c = Number(count);
-      edgeCountByLabel[String(label)] = c;
+    for (const row of edgeRows) {
+      const c = Number(row.cnt);
+      edgeCountByLabel[String(row.label)] = c;
       totalEdges += c;
     }
 

@@ -5,12 +5,9 @@ from __future__ import annotations
 import json
 import logging
 
-from gremlin_python.process.graph_traversal import __
-from gremlin_python.process.traversal import T
-
 from strands import tool
 
-from src.tools.graph_client import get_connection, map_to_dict, parse_json_field
+from src.tools.graph_client import execute_query, extract_node, parse_json_field
 
 logger = logging.getLogger(__name__)
 
@@ -25,121 +22,84 @@ def get_package(package_code: str) -> str:
     Args:
         package_code: The unique package code, e.g. 'JKP130260401TWX'.
     """
-    g = get_connection()
+    params = {"code": package_code}
 
     # --- Package node ---
-    pkg_maps = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .valueMap(True)
-        .toList()
+    pkg_rows = execute_query(
+        "MATCH (p:Package {code: $code}) RETURN p",
+        params,
     )
-    if not pkg_maps:
+    if not pkg_rows:
         return json.dumps({"error": f"Package '{package_code}' not found"}, ensure_ascii=False)
 
-    package = map_to_dict(pkg_maps[0])
-    # Parse JSON-encoded fields
+    package = extract_node(pkg_rows[0], "p")
     for field in ("season", "hashtags", "guide_fee"):
         if field in package:
             package[field] = parse_json_field(package[field])
 
     # --- Visited cities ---
-    cities = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .outE("VISITS")
-        .project("city", "day", "order")
-        .by(__.inV().valueMap(True))
-        .by(__.values("day").fold())
-        .by(__.values("order").fold())
-        .toList()
+    city_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[v:VISITS]->(c:City) "
+        "RETURN c, v.day AS day, v.`order` AS order",
+        params,
     )
     city_list = []
-    for c in cities:
-        city_data = map_to_dict(c["city"])
-        day_vals = c.get("day", [])
-        order_vals = c.get("order", [])
-        city_data["day"] = day_vals[0] if day_vals else None
-        city_data["order"] = order_vals[0] if order_vals else None
+    for row in city_rows:
+        city_data = extract_node(row, "c")
+        city_data["day"] = row.get("day")
+        city_data["order"] = row.get("order")
         city_list.append(city_data)
 
     # --- Included attractions ---
-    attractions = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .outE("INCLUDES")
-        .project("attraction", "day", "order", "layer")
-        .by(__.inV().valueMap(True))
-        .by(__.values("day").fold())
-        .by(__.values("order").fold())
-        .by(__.values("layer").fold())
-        .toList()
+    attr_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[i:INCLUDES]->(a:Attraction) "
+        "RETURN a, i.day AS day, i.`order` AS order, i.layer AS layer",
+        params,
     )
     attraction_list = []
-    for a in attractions:
-        attr_data = map_to_dict(a["attraction"])
-        attr_data["day"] = (a.get("day") or [None])[0]
-        attr_data["order"] = (a.get("order") or [None])[0]
-        attr_data["layer"] = (a.get("layer") or [None])[0]
+    for row in attr_rows:
+        attr_data = extract_node(row, "a")
+        attr_data["day"] = row.get("day")
+        attr_data["order"] = row.get("order")
+        attr_data["layer"] = row.get("layer")
         attraction_list.append(attr_data)
 
     # --- Hotels ---
-    hotels = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .out("INCLUDES_HOTEL")
-        .valueMap(True)
-        .toList()
+    hotel_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[:INCLUDES_HOTEL]->(h:Hotel) RETURN h",
+        params,
     )
-    hotel_list = [map_to_dict(h) for h in hotels]
+    hotel_list = [extract_node(row, "h") for row in hotel_rows]
 
     # --- Routes (flights) ---
-    routes = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .outE("DEPARTS_ON")
-        .project("route", "type")
-        .by(__.inV().valueMap(True))
-        .by(__.values("type").fold())
-        .toList()
+    route_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[d:DEPARTS_ON]->(r:Route) "
+        "RETURN r, d.type AS flight_type",
+        params,
     )
     route_list = []
-    for r in routes:
-        route_data = map_to_dict(r["route"])
-        route_data["flight_type"] = (r.get("type") or [None])[0]
+    for row in route_rows:
+        route_data = extract_node(row, "r")
+        route_data["flight_type"] = row.get("flight_type")
         route_list.append(route_data)
 
     # --- Themes ---
-    themes = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .out("TAGGED")
-        .valueMap(True)
-        .toList()
+    theme_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[:TAGGED]->(t:Theme) RETURN t",
+        params,
     )
-    theme_list = [map_to_dict(t) for t in themes]
+    theme_list = [extract_node(row, "t") for row in theme_rows]
 
     # --- Activities ---
-    activities = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .outE("HAS_ACTIVITY")
-        .project("activity", "day")
-        .by(__.inV().valueMap(True))
-        .by(__.values("day").fold())
-        .toList()
+    act_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[ha:HAS_ACTIVITY]->(a) "
+        "RETURN a, ha.day AS day",
+        params,
     )
     activity_list = []
-    for act in activities:
-        act_data = map_to_dict(act["activity"])
-        act_data["day"] = (act.get("day") or [None])[0]
+    for row in act_rows:
+        act_data = extract_node(row, "a")
+        act_data["day"] = row.get("day")
         activity_list.append(act_data)
 
     result = {

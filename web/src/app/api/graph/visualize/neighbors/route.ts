@@ -1,12 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode, toGraphNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import { valkeyGet, valkeySet, ValkeyTTL } from "@/lib/valkey";
-import gremlin from "gremlin";
 import type { GraphData } from "@/lib/types";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const __ = gremlin.process.statics as any;
 
 /**
  * GET /api/graph/visualize/neighbors
@@ -40,64 +36,54 @@ export async function GET(request: NextRequest) {
       return NextResponse.json(l2);
     }
 
-    const g = await getTraversal();
-
     // 1. Get the source vertex by ID
-    const sourceResults = await g.V(id).valueMap(true).toList();
+    const sourceRows = await executeQuery(
+      "MATCH (n) WHERE id(n) = $nodeId RETURN n",
+      { nodeId: id }
+    );
 
-    if (sourceResults.length === 0) {
+    if (sourceRows.length === 0) {
       return NextResponse.json(
         { error: `정점 '${id}'를 찾을 수 없습니다.` },
         { status: 404 }
       );
     }
 
-    const sourceObj = mapToObject<Record<string, unknown>>(
-      sourceResults[0] as Map<string, unknown>
-    );
-    const sourceId = String(sourceObj.id ?? sourceObj["T.id"] ?? "");
-    const sourceNode = toGraphNode(sourceObj, sourceId);
+    const sourceProps = extractNode(sourceRows[0] as Record<string, unknown>, "n");
+    if (!sourceProps.id) sourceProps.id = id;
+    const sourceNode = toGraphNode(sourceProps);
 
     // 2. Get 1-hop neighbors (both directions)
-    const neighborResults = await g
-      .V(id)
-      .both()
-      .dedup()
-      .valueMap(true)
-      .toList();
+    const neighborRows = await executeQuery(
+      "MATCH (n)--(m) WHERE id(n) = $nodeId RETURN DISTINCT m, id(m) AS nodeId",
+      { nodeId: id }
+    );
 
-    const neighborNodes = neighborResults.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(
-        r as Map<string, unknown>
-      );
-      const nid = String(obj.id ?? obj["T.id"] ?? "");
-      return toGraphNode(obj, nid);
+    const neighborNodes = neighborRows.map((row) => {
+      const r = row as Record<string, unknown>;
+      const props = extractNode(r, "m");
+      if (!props.id && r.nodeId) props.id = r.nodeId;
+      return toGraphNode(props);
     });
 
     const allNodes = [sourceNode, ...neighborNodes];
     const nodeIdSet = new Set(allNodes.map((n) => n.id));
 
-    // 3. Get edges from/to the source vertex using project() for reliable extraction
-    const edgeResults = await g
-      .V(id)
-      .bothE()
-      .dedup()
-      .project("id", "label", "source", "target")
-      .by(__.id())
-      .by(__.label())
-      .by(__.outV().id())
-      .by(__.inV().id())
-      .toList();
+    // 3. Get edges from/to the source vertex
+    const edgeRows = await executeQuery(
+      "MATCH (n)-[r]-(m) WHERE id(n) = $nodeId " +
+      "RETURN DISTINCT id(r) AS eid, type(r) AS label, " +
+      "id(startNode(r)) AS source, id(endNode(r)) AS target",
+      { nodeId: id }
+    );
 
     const links: Array<{ id: string; source: string; target: string; label: string }> = [];
-    for (const e of edgeResults) {
-      const obj = mapToObject<Record<string, unknown>>(
-        e as Map<string, unknown>
-      );
-      const edgeId = String(obj.id ?? "");
-      const edgeLabel = String(obj.label ?? "");
-      const source = String(obj.source ?? "");
-      const target = String(obj.target ?? "");
+    for (const row of edgeRows) {
+      const r = row as Record<string, unknown>;
+      const edgeId = String(r.eid ?? "");
+      const edgeLabel = String(r.label ?? "");
+      const source = String(r.source ?? "");
+      const target = String(r.target ?? "");
 
       if (source && target && nodeIdSet.has(source) && nodeIdSet.has(target)) {
         links.push({ id: edgeId, source, target, label: edgeLabel });
@@ -124,28 +110,4 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-function toGraphNode(obj: Record<string, unknown>, id: string) {
-  const label =
-    extractValue(obj, "name") ?? extractValue(obj, "code") ?? id;
-  const type = String(obj.label ?? obj["T.label"] ?? "unknown");
-
-  const properties: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(obj)) {
-    if (key !== "id" && key !== "label" && key !== "T.id" && key !== "T.label") {
-      properties[key] = Array.isArray(val) && val.length === 1 ? val[0] : val;
-    }
-  }
-
-  return { id, label: String(label), type, properties };
-}
-
-function extractValue(
-  obj: Record<string, unknown>,
-  key: string
-): string | undefined {
-  const v = obj[key];
-  if (v === undefined || v === null) return undefined;
-  return String(Array.isArray(v) ? v[0] : v);
 }

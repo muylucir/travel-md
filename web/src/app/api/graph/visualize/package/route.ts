@@ -1,12 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode, toGraphNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import { valkeyGet, valkeySet, ValkeyTTL } from "@/lib/valkey";
-import gremlin from "gremlin";
 import type { GraphData } from "@/lib/types";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const __ = gremlin.process.statics as any;
 
 /**
  * GET /api/graph/visualize/package
@@ -40,69 +36,56 @@ export async function GET(request: NextRequest) {
       return NextResponse.json(l2);
     }
 
-    const g = await getTraversal();
-
     // 1. Find the package vertex
-    const pkgResults = await g
-      .V()
-      .hasLabel("Package")
-      .has("code", code)
-      .valueMap(true)
-      .toList();
+    const pkgRows = await executeQuery(
+      "MATCH (p:Package {code: $code}) RETURN p, id(p) AS nodeId",
+      { code }
+    );
 
-    if (pkgResults.length === 0) {
+    if (pkgRows.length === 0) {
       return NextResponse.json(
         { error: `패키지 '${code}'를 찾을 수 없습니다.` },
         { status: 404 }
       );
     }
 
-    const pkgObj = mapToObject<Record<string, unknown>>(
-      pkgResults[0] as Map<string, unknown>
-    );
-    const pkgId = String(pkgObj.id ?? pkgObj["T.id"] ?? "");
-    const pkgNode = toGraphNode(pkgObj, pkgId);
+    const pkgRow = pkgRows[0] as Record<string, unknown>;
+    const pkgProps = extractNode(pkgRow, "p");
+    const pkgId = String(pkgRow.nodeId ?? pkgProps.id ?? "");
+    if (!pkgProps.id) pkgProps.id = pkgId;
+    const pkgNode = toGraphNode(pkgProps);
 
     // 2. Get 1-hop neighbors (both directions)
-    const neighborResults = await g
-      .V(pkgId)
-      .both()
-      .dedup()
-      .valueMap(true)
-      .toList();
+    const neighborRows = await executeQuery(
+      "MATCH (p:Package {code: $code})--(m) RETURN DISTINCT m, id(m) AS nodeId",
+      { code }
+    );
 
-    const neighborNodes = neighborResults.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(
-        r as Map<string, unknown>
-      );
-      const id = String(obj.id ?? obj["T.id"] ?? "");
-      return toGraphNode(obj, id);
+    const neighborNodes = neighborRows.map((row) => {
+      const r = row as Record<string, unknown>;
+      const props = extractNode(r, "m");
+      if (!props.id && r.nodeId) props.id = r.nodeId;
+      return toGraphNode(props);
     });
 
     const allNodes = [pkgNode, ...neighborNodes];
     const nodeIdSet = new Set(allNodes.map((n) => n.id));
 
-    // 3. Get edges from the package vertex using project() for reliable extraction
-    const edgeResults = await g
-      .V(pkgId)
-      .bothE()
-      .dedup()
-      .project("id", "label", "source", "target")
-      .by(__.id())
-      .by(__.label())
-      .by(__.outV().id())
-      .by(__.inV().id())
-      .toList();
+    // 3. Get edges from the package vertex
+    const edgeRows = await executeQuery(
+      "MATCH (p:Package {code: $code})-[r]-(m) " +
+      "RETURN DISTINCT id(r) AS eid, type(r) AS label, " +
+      "id(startNode(r)) AS source, id(endNode(r)) AS target",
+      { code }
+    );
 
     const links: Array<{ id: string; source: string; target: string; label: string }> = [];
-    for (const e of edgeResults) {
-      const obj = mapToObject<Record<string, unknown>>(
-        e as Map<string, unknown>
-      );
-      const edgeId = String(obj.id ?? "");
-      const edgeLabel = String(obj.label ?? "");
-      const source = String(obj.source ?? "");
-      const target = String(obj.target ?? "");
+    for (const row of edgeRows) {
+      const r = row as Record<string, unknown>;
+      const edgeId = String(r.eid ?? "");
+      const edgeLabel = String(r.label ?? "");
+      const source = String(r.source ?? "");
+      const target = String(r.target ?? "");
 
       if (source && target && nodeIdSet.has(source) && nodeIdSet.has(target)) {
         links.push({ id: edgeId, source, target, label: edgeLabel });
@@ -129,28 +112,4 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-function toGraphNode(obj: Record<string, unknown>, id: string) {
-  const label =
-    extractValue(obj, "name") ?? extractValue(obj, "code") ?? id;
-  const type = String(obj.label ?? obj["T.label"] ?? "unknown");
-
-  const properties: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(obj)) {
-    if (key !== "id" && key !== "label" && key !== "T.id" && key !== "T.label") {
-      properties[key] = Array.isArray(val) && val.length === 1 ? val[0] : val;
-    }
-  }
-
-  return { id, label: String(label), type, properties };
-}
-
-function extractValue(
-  obj: Record<string, unknown>,
-  key: string
-): string | undefined {
-  const v = obj[key];
-  if (v === undefined || v === null) return undefined;
-  return String(Array.isArray(v) ? v[0] : v);
 }

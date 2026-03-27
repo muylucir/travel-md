@@ -1,11 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import gremlin from "gremlin";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { CityNode } from "@/lib/types";
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const asc = (gremlin.process as any).order.asc;
 
 /**
  * GET /api/graph/cities
@@ -25,31 +21,32 @@ export async function GET(request: NextRequest) {
   if (cached) return NextResponse.json(cached);
 
   try {
-    const g = await getTraversal();
-    let traversal = g.V().hasLabel("City");
+    const params: Record<string, unknown> = {};
+    let whereClause = "";
 
     if (country) {
-      traversal = traversal.has("country", country);
+      whereClause = " WHERE c.country = $country";
+      params.country = country;
     } else if (region) {
-      traversal = traversal.has("region", region);
+      whereClause = " WHERE c.region = $region";
+      params.region = region;
     }
 
-    const results = await traversal
-      .order()
-      .by("name", asc)
-      .valueMap(true)
-      .toList();
+    const results = await executeQuery(
+      `MATCH (c:City)${whereClause} RETURN c ORDER BY c.name`,
+      Object.keys(params).length > 0 ? params : undefined
+    );
 
-    const cities: CityNode[] = results.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(r as Map<string, unknown>);
+    const cities: CityNode[] = results.map((row) => {
+      const obj = extractNode(row as Record<string, unknown>, "c");
       return {
-        name: extractValue(obj, "name") as string,
-        country: extractValue(obj, "country") as string,
-        region: extractValue(obj, "region") as string,
-        code: extractValue(obj, "code") as string | undefined,
-        timezone: extractValue(obj, "timezone") as string | undefined,
-        voltage: extractValue(obj, "voltage") as string | undefined,
-        size: extractValue(obj, "size") as string | undefined,
+        name: String(obj.name || ""),
+        country: String(obj.country || ""),
+        region: String(obj.region || ""),
+        code: obj.code as string | undefined,
+        timezone: obj.timezone as string | undefined,
+        voltage: obj.voltage as string | undefined,
+        size: obj.size as string | undefined,
       };
     });
 
@@ -62,12 +59,4 @@ export async function GET(request: NextRequest) {
       { status: 500 }
     );
   }
-}
-
-function extractValue(
-  obj: Record<string, unknown>,
-  key: string
-): unknown {
-  const v = obj[key];
-  return Array.isArray(v) ? v[0] : v;
 }
