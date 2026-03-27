@@ -1,7 +1,7 @@
 {
   "$schema": "OTA Travel GraphRAG Schema",
   "description": "Neptune Knowledge Graph schema for OTA Travel Agent — 12 vertex types, 19 edge types",
-  "database": "Amazon Neptune (Gremlin)",
+  "database": "Amazon Neptune (OpenCypher)",
 
   "vertices": {
     "Package": {

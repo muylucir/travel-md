@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getTraversal } from "@/lib/gremlin";
+import { executeQuery } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 
 const CACHE_KEY = "countries";
@@ -13,9 +13,10 @@ export async function GET() {
   if (cached) return NextResponse.json(cached);
 
   try {
-    const g = await getTraversal();
-    const results = await g.V().hasLabel("Country").values("name").toList();
-    const countries = (results as string[]).sort();
+    const results = await executeQuery<{ name: string }>(
+      "MATCH (c:Country) RETURN c.name AS name ORDER BY c.name"
+    );
+    const countries = results.map((r) => r.name);
     cacheSet(CACHE_KEY, countries, TTL.STATIC);
     return NextResponse.json(countries);
   } catch (error) {

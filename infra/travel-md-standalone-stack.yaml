@@ -1005,7 +1005,7 @@ Resources:
                   SCHEMA_TABLE_NAME={{ SchemaTableName }}
                   NEPTUNE_HOST={{ NeptuneHost }}
                   NEPTUNE_PORT=8182
-                  GREMLIN_ENDPOINT=wss://{{ NeptuneHost }}:8182/gremlin
+                  NEPTUNE_ENDPOINT=https://{{ NeptuneHost }}:8182
                   REDIS_HOST={{ ValkeyHost }}
                   REDIS_PORT=6379
                   BULK_LOAD_S3_BUCKET={{ BulkLoadS3Bucket }}
@@ -1101,7 +1101,7 @@ Resources:
           - !Ref PrivateSubnet2
       Environment:
         Variables:
-          GREMLIN_ENDPOINT: !Join ['', ['wss://', !GetAtt NeptuneCluster.Endpoint, ':8182/gremlin']]
+          NEPTUNE_ENDPOINT: !Join ['', ['https://', !GetAtt NeptuneCluster.Endpoint, ':8182']]
           DYNAMODB_TABLE_NAME: !Ref DynamoTable
           REDIS_HOST: !GetAtt ValkeyCache.Endpoint.Address
           REDIS_PORT: '6379'

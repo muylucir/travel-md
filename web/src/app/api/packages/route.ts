@@ -1,27 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
-import gremlin from "gremlin";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { PackageNode } from "@/lib/types";
 
-const __ = gremlin.process.statics;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const P = (gremlin.process as any).P;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const TextP = (gremlin.process as any).TextP;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const desc = (gremlin.process as any).order.desc;
-
 /**
  * GET /api/packages
- * List packages from Neptune via Gremlin.
+ * List packages from Neptune via OpenCypher.
  *
  * Query params:
  *   destination - filter by region/destination
  *   theme       - filter by theme tag
  *   season      - filter by season
  *   nights      - filter by number of nights
- *   limit       - max results (default 20)
+ *   limit       - max results (default 100)
  */
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
@@ -36,77 +27,59 @@ export async function GET(request: NextRequest) {
   if (cached) return NextResponse.json(cached);
 
   try {
-    const g = await getTraversal();
-
-    let traversal = g.V().hasLabel("Package");
+    const matchParts = ["MATCH (p:Package)"];
+    const whereParts: string[] = [];
+    const params: Record<string, unknown> = {};
 
     if (destination) {
-      // Filter packages that visit cities matching by name, region, or country
-      traversal = g
-        .V()
-        .hasLabel("Package")
-        .where(
-          (__.out("VISITS") as any)
-            .hasLabel("City")
-            .or(
-              __.has("name", destination),
-              __.has("region", destination),
-              __.has("country", destination)
-            )
-        )
-        .dedup();
+      matchParts[0] = "MATCH (p:Package)-[:VISITS]->(c:City)";
+      whereParts.push("(c.name = $dest OR c.region = $dest OR c.country = $dest)");
+      params.dest = destination;
     }
 
     if (theme) {
-      traversal = traversal.where(__.out("TAGGED").has("name", theme));
+      matchParts.push("MATCH (p)-[:TAGGED]->(th:Theme {name: $theme})");
+      params.theme = theme;
     }
 
     if (season) {
-      traversal = traversal.has("season", TextP.containing(season));
+      whereParts.push("p.season CONTAINS $season");
+      params.season = season;
     }
 
     if (nights) {
-      traversal = traversal.has("nights", parseInt(nights, 10));
+      whereParts.push("p.nights = $nights");
+      params.nights = parseInt(nights, 10);
     }
 
-    const results = await traversal
-      .order()
-      .by("rating", desc)
-      .limit(limit)
-      .valueMap(true)
-      .toList();
+    let query = matchParts.join("\n");
+    if (whereParts.length > 0) {
+      query += "\nWHERE " + whereParts.join(" AND ");
+    }
+    query += `\nRETURN DISTINCT p ORDER BY p.rating DESC LIMIT ${limit}`;
 
-    const packages: PackageNode[] = results.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(r as Map<string, unknown>);
-      return normalizePackage(obj);
+    const rows = await executeQuery(query, params);
+
+    const packages: PackageNode[] = rows.map((row) => {
+      const props = extractNode(row as Record<string, unknown>, "p");
+      return normalizePackage(props);
     });
 
     // Batch-fetch travel cities for each package via VISITS edges
     const packageCodes = packages.map((p) => p.code).filter(Boolean);
     if (packageCodes.length > 0) {
       try {
-        const cityResults = await g
-          .V()
-          .hasLabel("Package")
-          .has("code", P.within(packageCodes))
-          .project("code", "cities")
-          .by((__ as any).values("code"))
-          .by(
-            (__.out("VISITS") as any)
-              .hasLabel("City")
-              .dedup()
-              .values("name")
-              .fold()
-          )
-          .toList();
+        const cityRows = await executeQuery<{ code: string; cities: string[] }>(
+          "MATCH (p:Package)-[:VISITS]->(c:City) " +
+          "WHERE p.code IN $codes " +
+          "RETURN p.code AS code, collect(DISTINCT c.name) AS cities",
+          { codes: packageCodes }
+        );
 
         const cityMap = new Map<string, string>();
-        for (const row of cityResults) {
-          const obj = mapToObject<{ code: string; cities: string[] }>(
-            row as Map<string, unknown>
-          );
-          if (obj.code && Array.isArray(obj.cities) && obj.cities.length > 0) {
-            cityMap.set(obj.code, obj.cities.join(", "));
+        for (const row of cityRows) {
+          if (row.code && Array.isArray(row.cities) && row.cities.length > 0) {
+            cityMap.set(row.code, row.cities.join(", "));
           }
         }
 
@@ -132,15 +105,11 @@ export async function GET(request: NextRequest) {
   }
 }
 
-function normalizePackage(obj: Record<string, unknown>): PackageNode {
-  // Neptune valueMap returns arrays for property values
-  const val = (key: string): unknown => {
-    const v = obj[key];
-    return Array.isArray(v) ? v[0] : v;
-  };
+function normalizePackage(props: Record<string, unknown>): PackageNode {
+  const val = (key: string): unknown => props[key];
 
   const arrVal = (key: string): string[] => {
-    const v = obj[key];
+    const v = props[key];
     if (Array.isArray(v)) return v.map(String);
     if (typeof v === "string") {
       try {

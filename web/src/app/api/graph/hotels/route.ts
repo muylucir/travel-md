@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 import type { HotelNode } from "@/lib/types";
 
@@ -30,41 +30,37 @@ export async function GET(request: NextRequest) {
     const cached = cacheGet<HotelNode[]>(cacheKey);
     if (cached) return NextResponse.json(cached);
 
-    const g = await getTraversal();
-    let traversal = g
-      .V()
-      .hasLabel("City")
-      .has("name", city)
-      .out("HAS_HOTEL")
-      .hasLabel("Hotel");
+    const params: Record<string, unknown> = { city };
+    const filters: string[] = [];
 
     if (grade) {
-      traversal = traversal.has("grade", grade);
+      filters.push("h.grade = $grade");
+      params.grade = grade;
     }
 
     if (hasOnsen === "true") {
-      traversal = traversal.has("has_onsen", true);
+      filters.push("h.has_onsen = true");
     }
 
-    const results = await traversal
-      .dedup()
-      .valueMap(true)
-      .toList();
+    const whereClause = filters.length > 0
+      ? ` WHERE ${filters.join(" AND ")}`
+      : "";
 
-    const hotels: HotelNode[] = results.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(r as Map<string, unknown>);
-      const val = (key: string) => {
-        const v = obj[key];
-        return Array.isArray(v) ? v[0] : v;
-      };
+    const results = await executeQuery(
+      `MATCH (:City {name: $city})-[:HAS_HOTEL]->(h:Hotel)${whereClause} RETURN DISTINCT h`,
+      params
+    );
+
+    const hotels: HotelNode[] = results.map((row) => {
+      const obj = extractNode(row as Record<string, unknown>, "h");
       return {
-        name_ko: String(val("name_ko") || ""),
-        name_en: String(val("name_en") || ""),
-        grade: String(val("grade") || ""),
-        room_type: val("room_type") as string | undefined,
-        has_onsen: Boolean(val("has_onsen")),
-        amenities: val("amenities") as string | undefined,
-        description: val("description") as string | undefined,
+        name_ko: String(obj.name_ko || ""),
+        name_en: String(obj.name_en || ""),
+        grade: String(obj.grade || ""),
+        room_type: obj.room_type as string | undefined,
+        has_onsen: Boolean(obj.has_onsen),
+        amenities: obj.amenities as string | undefined,
+        description: obj.description as string | undefined,
       };
     });
 

@@ -1,11 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal, mapToObject, parseJsonProperty } from "@/lib/gremlin";
+import { executeQuery, extractNode, parseJsonProperty } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
-import gremlin from "gremlin";
-
-const __ = gremlin.process.statics;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const P = (gremlin.process as any).P;
 
 /**
  * GET /api/graph/trends?region=xxx&country=xxx&city=xxx&min_score=0
@@ -27,87 +22,48 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const g = await getTraversal();
+    // Build location filter for the City node
+    const params: Record<string, unknown> = { min_score: minScore };
+    let cityFilter = "";
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let raw: any[];
-
-    // Build city filter based on most specific parameter
-    const hasCityFilter = city || region || country;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const buildCityFilter = (base: any) => {
-      const located = base.out("LOCATED_IN").hasLabel("City");
-      if (city) return located.has("name", city);
-      if (region) return located.has("region", region);
-      if (country) return located.has("country", country);
-      return located;
-    };
-
-    if (hasCityFilter) {
-      // Filtered: Trend → TrendSpot → City (by city/region/country)
-      raw = await g
-        .V()
-        .hasLabel("Trend")
-        .has("virality_score", P.gte(minScore))
-        .where(
-          buildCityFilter(__.out("FILMED_AT", "FEATURES"))
-        )
-        .project("trend", "spots")
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        .by((__ as any).valueMap(true))
-        .by(
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (__.out("FILMED_AT", "FEATURES") as any)
-            .where(
-              buildCityFilter(__)
-            )
-            .valueMap(true)
-            .fold()
-        )
-        .toList();
-    } else {
-      // Overview: all trends with their spots
-      raw = await g
-        .V()
-        .hasLabel("Trend")
-        .has("virality_score", P.gte(minScore))
-        .project("trend", "spots")
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        .by((__ as any).valueMap(true))
-        .by(
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (__.out("FILMED_AT", "FEATURES") as any)
-            .valueMap(true)
-            .fold()
-        )
-        .toList();
+    if (city) {
+      cityFilter = "{name: $location}";
+      params.location = city;
+    } else if (region) {
+      cityFilter = "{region: $location}";
+      params.location = region;
+    } else if (country) {
+      cityFilter = "{country: $location}";
+      params.location = country;
     }
 
+    let query: string;
+    if (cityFilter) {
+      query =
+        `MATCH (t:Trend)-[rel:FILMED_AT|FEATURES]->(ts:TrendSpot)-[:LOCATED_IN]->(c:City ${cityFilter}) ` +
+        `WHERE t.virality_score >= $min_score ` +
+        `WITH t, collect(DISTINCT ts) AS spots ` +
+        `RETURN t, spots`;
+    } else {
+      query =
+        `MATCH (t:Trend) WHERE t.virality_score >= $min_score ` +
+        `OPTIONAL MATCH (t)-[:FILMED_AT|FEATURES]->(ts:TrendSpot) ` +
+        `WITH t, collect(DISTINCT ts) AS spots ` +
+        `RETURN t, spots`;
+    }
+
+    const raw = await executeQuery(query, params);
     const now = new Date();
     const trends = [];
 
     for (const item of raw) {
-      // .project() returns Map in gremlin JS, but handle plain objects too
-      const getter = (obj: unknown, key: string): unknown => {
-        if (obj instanceof Map) return obj.get(key);
-        if (obj && typeof obj === "object") return (obj as Record<string, unknown>)[key];
-        return undefined;
-      };
-      const trendMap = getter(item, "trend") as Map<string, unknown>;
-      const spotMaps = (getter(item, "spots") || []) as Array<Map<string, unknown>>;
+      const trendProps = extractNode(item as Record<string, unknown>, "t");
 
-      const trend = mapToObject<Record<string, unknown>>(trendMap);
-      const val = (key: string): unknown => {
-        const v = trend[key];
-        return Array.isArray(v) ? v[0] : v;
-      };
-
-      const virality = Number(val("virality_score") || 0);
-      const decay = Number(val("decay_rate") || 0.1);
-      const dateStr = String(val("date") || "");
-      const keywords = parseJsonProperty<string[]>(val("keywords"), []);
-      const evidence = parseJsonProperty<Array<Record<string, string>>>(val("evidence"), []);
+      const virality = Number(trendProps.virality_score || 0);
+      const decay = Number(trendProps.decay_rate || 0.1);
+      const dateStr = String(trendProps.date || "");
+      const keywords = parseJsonProperty<string[]>(trendProps.keywords, []);
+      const evidence = parseJsonProperty<Array<Record<string, string>>>(trendProps.evidence, []);
 
       // Compute effective score with time decay
       let effectiveScore = virality;
@@ -127,28 +83,27 @@ export async function GET(request: NextRequest) {
 
       if (effectiveScore < minScore) continue;
 
-      const spots = spotMaps.map((s: Map<string, unknown>) => {
-        const spot = mapToObject<Record<string, unknown>>(s);
-        const sv = (key: string): unknown => {
-          const v = spot[key];
-          return Array.isArray(v) ? v[0] : v;
-        };
-        return {
-          id: String(sv("id") || ""),
-          name: String(sv("name") || ""),
-          description: String(sv("description") || ""),
-          category: String(sv("category") || ""),
-          lat: Number(sv("lat") || 0),
-          lng: Number(sv("lng") || 0),
-          photo_worthy: Boolean(sv("photo_worthy")),
-        };
-      });
+      const spotsRaw = (item as Record<string, unknown>).spots;
+      const spots = Array.isArray(spotsRaw)
+        ? spotsRaw.map((s) => {
+            const sp = extractNode({ s }, "s");
+            return {
+              id: String(sp.id || ""),
+              name: String(sp.name || ""),
+              description: String(sp.description || ""),
+              category: String(sp.category || ""),
+              lat: Number(sp.lat || 0),
+              lng: Number(sp.lng || 0),
+              photo_worthy: Boolean(sp.photo_worthy),
+            };
+          })
+        : [];
 
       trends.push({
-        id: String(val("id") || ""),
-        title: String(val("title") || ""),
-        type: String(val("type") || ""),
-        source: String(val("source") || ""),
+        id: String(trendProps.id || ""),
+        title: String(trendProps.title || ""),
+        type: String(trendProps.type || ""),
+        source: String(trendProps.source || ""),
         date: dateStr,
         virality_score: virality,
         decay_rate: decay,
@@ -157,7 +112,7 @@ export async function GET(request: NextRequest) {
         spots,
         evidence,
         tier: (() => {
-          const serverTier = String(val("tier") || "");
+          const serverTier = String(trendProps.tier || "");
           if (serverTier === "hot" || serverTier === "steady" || serverTier === "seasonal") return serverTier;
           return decay <= 0.10 ? "hot" : decay <= 0.25 ? "steady" : "seasonal";
         })(),

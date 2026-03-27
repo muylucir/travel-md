@@ -3,6 +3,8 @@
 Routes incoming tool invocations to the appropriate graph or DynamoDB
 function and returns results in MCP-compatible format.
 
+Graph queries use Neptune OpenCypher via boto3 (stateless HTTPS).
+
 AgentCore Gateway sends:
     - event: tool arguments as a flat dict (e.g. {"destination": "오사카"})
     - context.client_context.custom["bedrockAgentCoreToolName"]:
@@ -107,17 +109,6 @@ def handler(event, context):
         return {"content": [{"type": "text", "text": result}]}
     except Exception as e:
         logger.error("Tool %s failed: %s\n%s", tool_name, e, traceback.format_exc())
-
-        # Reset Neptune connection on transport/connection errors so next
-        # invocation gets a fresh WebSocket.
-        err_msg = str(e).lower()
-        if any(kw in err_msg for kw in ("closing transport", "closed", "connection", "websocket")):
-            try:
-                from graph_client import reset_connection
-                reset_connection()
-                logger.info("Neptune connection reset after transport error")
-            except Exception:
-                pass
 
         error_msg = json.dumps({"error": str(e), "tool": tool_name}, ensure_ascii=False)
         return {"content": [{"type": "text", "text": error_msg}], "isError": True}

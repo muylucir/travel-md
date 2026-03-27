@@ -1,16 +1,13 @@
-"""Tool: search_packages -- Multi-condition package search via Gremlin."""
+"""Tool: search_packages -- Multi-condition package search via OpenCypher."""
 
 from __future__ import annotations
 
 import json
 import logging
 
-from gremlin_python.process.graph_traversal import __
-from gremlin_python.process.traversal import P, TextP, Order
-
 from strands import tool
 
-from src.tools.graph_client import get_connection, map_to_dict, parse_json_field
+from src.tools.graph_client import execute_query, extract_node, parse_json_field
 
 logger = logging.getLogger(__name__)
 
@@ -37,48 +34,34 @@ def search_packages(
         max_budget: Optional maximum price per person in KRW (0 means no filter).
         shopping_max: Optional maximum shopping count (-1 means no filter).
     """
-    g = get_connection()
+    match_parts = ["MATCH (p:Package)-[:VISITS]->(c:City)"]
+    where_parts = ["(c.name = $dest OR c.region = $dest)"]
+    params: dict = {"dest": destination}
 
-    # Start from packages that visit the destination (city or region)
-    t = (
-        g.V()
-        .hasLabel("Package")
-        .where(
-            __.out("VISITS")
-            .hasLabel("City")
-            .or_(
-                __.has("name", destination),
-                __.has("region", destination),
-            )
-        )
-    )
-
-    # Theme filter
     if theme:
-        t = t.where(__.out("TAGGED").has("name", theme))
-
-    # Season filter -- season is stored as JSON array string or multi-value property
+        match_parts.append("MATCH (p)-[:TAGGED]->(th:Theme {name: $theme})")
+        params["theme"] = theme
     if season:
-        t = t.has("season", TextP.containing(season))
-
-    # Nights filter
+        where_parts.append("p.season CONTAINS $season")
+        params["season"] = season
     if nights and nights > 0:
-        t = t.has("nights", nights)
-
-    # Budget filter
+        where_parts.append("p.nights = $nights")
+        params["nights"] = nights
     if max_budget and max_budget > 0:
-        t = t.has("price", P.lte(max_budget))
-
-    # Shopping count filter
+        where_parts.append("p.price <= $max_budget")
+        params["max_budget"] = max_budget
     if shopping_max >= 0:
-        t = t.has("shopping_count", P.lte(shopping_max))
+        where_parts.append("p.shopping_count <= $shopping_max")
+        params["shopping_max"] = shopping_max
 
-    # Order and limit
-    results = t.order().by("rating", Order.desc).limit(10).valueMap(True).toList()
+    query = "\n".join(match_parts)
+    query += "\nWHERE " + " AND ".join(where_parts)
+    query += "\nRETURN DISTINCT p ORDER BY p.rating DESC LIMIT 10"
 
+    rows = execute_query(query, params)
     packages = []
-    for r in results:
-        pkg = map_to_dict(r)
+    for row in rows:
+        pkg = extract_node(row, "p")
         for field in ("season", "hashtags", "guide_fee"):
             if field in pkg:
                 pkg[field] = parse_json_field(pkg[field])

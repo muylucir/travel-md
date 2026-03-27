@@ -1,8 +1,6 @@
 """Graph RAG tools + Valkey caching + cache invalidation for Lambda.
 
-Reuses the Gremlin query logic from the agent tools but returns raw
-JSON strings suitable for the Lambda handler response.
-
+Uses Neptune OpenCypher (HTTPS) via boto3 neptunedata client.
 Read tools are cached in Valkey with per-tool TTLs. Write tools
 bypass the cache. The ``invalidate_cache`` tool deletes cached keys.
 """
@@ -15,10 +13,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from gremlin_python.process.graph_traversal import __
-from gremlin_python.process.traversal import P, TextP, Order
-
-from graph_client import get_connection, map_to_dict, parse_json_field
+from graph_client import execute_query, extract_node, parse_json_field
 
 logger = logging.getLogger(__name__)
 
@@ -69,97 +64,84 @@ def get_package(package_code: str) -> str:
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
 
-    pkg_maps = (
-        g.V()
-        .hasLabel("Package")
-        .has("code", package_code)
-        .valueMap(True)
-        .toList()
+    params = {"code": package_code}
+
+    # Package node
+    pkg_rows = execute_query(
+        "MATCH (p:Package {code: $code}) RETURN p",
+        params,
     )
-    if not pkg_maps:
+    if not pkg_rows:
         result = json.dumps({"error": f"Package '{package_code}' not found"}, ensure_ascii=False)
         _cache_set(cache_key, result, NEGATIVE_TTL)
         return result
 
-    package = map_to_dict(pkg_maps[0])
+    package = extract_node(pkg_rows[0], "p")
     for field in ("season", "hashtags", "guide_fee"):
         if field in package:
             package[field] = parse_json_field(package[field])
 
-    cities = (
-        g.V().hasLabel("Package").has("code", package_code)
-        .outE("VISITS")
-        .project("city", "day", "order")
-        .by(__.inV().valueMap(True))
-        .by(__.values("day").fold())
-        .by(__.values("order").fold())
-        .toList()
+    # Cities via VISITS edges (with edge properties)
+    city_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[v:VISITS]->(c:City) RETURN c, v.day AS day, v.`order` AS order",
+        params,
     )
     city_list = []
-    for c in cities:
-        city_data = map_to_dict(c["city"])
-        city_data["day"] = (c.get("day") or [None])[0]
-        city_data["order"] = (c.get("order") or [None])[0]
+    for row in city_rows:
+        city_data = extract_node(row, "c")
+        city_data["day"] = row.get("day")
+        city_data["order"] = row.get("order")
         city_list.append(city_data)
 
-    attractions = (
-        g.V().hasLabel("Package").has("code", package_code)
-        .outE("INCLUDES")
-        .project("attraction", "day", "order", "layer")
-        .by(__.inV().valueMap(True))
-        .by(__.values("day").fold())
-        .by(__.values("order").fold())
-        .by(__.values("layer").fold())
-        .toList()
+    # Attractions via INCLUDES edges (with edge properties)
+    attr_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[i:INCLUDES]->(a:Attraction) "
+        "RETURN a, i.day AS day, i.`order` AS order, i.layer AS layer",
+        params,
     )
     attraction_list = []
-    for a in attractions:
-        attr_data = map_to_dict(a["attraction"])
-        attr_data["day"] = (a.get("day") or [None])[0]
-        attr_data["order"] = (a.get("order") or [None])[0]
-        attr_data["layer"] = (a.get("layer") or [None])[0]
+    for row in attr_rows:
+        attr_data = extract_node(row, "a")
+        attr_data["day"] = row.get("day")
+        attr_data["order"] = row.get("order")
+        attr_data["layer"] = row.get("layer")
         attraction_list.append(attr_data)
 
-    hotels = (
-        g.V().hasLabel("Package").has("code", package_code)
-        .out("INCLUDES_HOTEL").valueMap(True).toList()
+    # Hotels
+    hotel_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[:INCLUDES_HOTEL]->(h:Hotel) RETURN h",
+        params,
     )
-    hotel_list = [map_to_dict(h) for h in hotels]
+    hotel_list = [extract_node(row, "h") for row in hotel_rows]
 
-    routes = (
-        g.V().hasLabel("Package").has("code", package_code)
-        .outE("DEPARTS_ON")
-        .project("route", "type")
-        .by(__.inV().valueMap(True))
-        .by(__.values("type").fold())
-        .toList()
+    # Routes via DEPARTS_ON edges (with edge type)
+    route_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[d:DEPARTS_ON]->(r:Route) RETURN r, d.type AS flight_type",
+        params,
     )
     route_list = []
-    for r in routes:
-        route_data = map_to_dict(r["route"])
-        route_data["flight_type"] = (r.get("type") or [None])[0]
+    for row in route_rows:
+        route_data = extract_node(row, "r")
+        route_data["flight_type"] = row.get("flight_type")
         route_list.append(route_data)
 
-    themes = (
-        g.V().hasLabel("Package").has("code", package_code)
-        .out("TAGGED").valueMap(True).toList()
+    # Themes
+    theme_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[:TAGGED]->(t:Theme) RETURN t",
+        params,
     )
-    theme_list = [map_to_dict(t) for t in themes]
+    theme_list = [extract_node(row, "t") for row in theme_rows]
 
-    activities = (
-        g.V().hasLabel("Package").has("code", package_code)
-        .outE("HAS_ACTIVITY")
-        .project("activity", "day")
-        .by(__.inV().valueMap(True))
-        .by(__.values("day").fold())
-        .toList()
+    # Activities via HAS_ACTIVITY edges (with edge day)
+    act_rows = execute_query(
+        "MATCH (p:Package {code: $code})-[ha:HAS_ACTIVITY]->(a) RETURN a, ha.day AS day",
+        params,
     )
     activity_list = []
-    for act in activities:
-        act_data = map_to_dict(act["activity"])
-        act_data["day"] = (act.get("day") or [None])[0]
+    for row in act_rows:
+        act_data = extract_node(row, "a")
+        act_data["day"] = row.get("day")
         activity_list.append(act_data)
 
     result = {
@@ -194,32 +176,35 @@ def search_packages(
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
 
-    t = (
-        g.V().hasLabel("Package")
-        .where(
-            __.out("VISITS").hasLabel("City")
-            .or_(__.has("name", destination), __.has("region", destination))
-        )
-    )
+    match_parts = ["MATCH (p:Package)-[:VISITS]->(c:City)"]
+    where_parts = ["(c.name = $dest OR c.region = $dest)"]
+    params: dict = {"dest": destination}
 
     if theme:
-        t = t.where(__.out("TAGGED").has("name", theme))
+        match_parts.append("MATCH (p)-[:TAGGED]->(th:Theme {name: $theme})")
+        params["theme"] = theme
     if season:
-        t = t.has("season", TextP.containing(season))
+        where_parts.append("p.season CONTAINS $season")
+        params["season"] = season
     if nights and nights > 0:
-        t = t.has("nights", nights)
+        where_parts.append("p.nights = $nights")
+        params["nights"] = nights
     if max_budget and max_budget > 0:
-        t = t.has("price", P.lte(max_budget))
+        where_parts.append("p.price <= $max_budget")
+        params["max_budget"] = max_budget
     if shopping_max >= 0:
-        t = t.has("shopping_count", P.lte(shopping_max))
+        where_parts.append("p.shopping_count <= $shopping_max")
+        params["shopping_max"] = shopping_max
 
-    results = t.order().by("rating", Order.desc).limit(10).valueMap(True).toList()
+    query = "\n".join(match_parts)
+    query += "\nWHERE " + " AND ".join(where_parts)
+    query += "\nRETURN DISTINCT p ORDER BY p.rating DESC LIMIT 10"
 
+    rows = execute_query(query, params)
     packages = []
-    for r in results:
-        pkg = map_to_dict(r)
+    for row in rows:
+        pkg = extract_node(row, "p")
         for field in ("season", "hashtags", "guide_fee"):
             if field in pkg:
                 pkg[field] = parse_json_field(pkg[field])
@@ -239,14 +224,12 @@ def get_routes_by_region(region: str) -> str:
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
 
-    results = (
-        g.V().hasLabel("Route")
-        .where(__.out("TO").hasLabel("City").has("region", region))
-        .valueMap(True).toList()
+    rows = execute_query(
+        "MATCH (r:Route)-[:TO]->(c:City {region: $region}) RETURN r",
+        {"region": region},
     )
-    routes = [map_to_dict(r) for r in results]
+    routes = [extract_node(row, "r") for row in rows]
     result_str = json.dumps({"routes": routes, "count": len(routes)}, ensure_ascii=False, default=str)
     _cache_set(cache_key, result_str, CACHE_TTL["get_routes_by_region"])
     return result_str
@@ -261,17 +244,16 @@ def get_attractions_by_city(city: str, category: str = "") -> str:
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
 
-    t = (
-        g.V().hasLabel("City").has("name", city)
-        .out("HAS_ATTRACTION").hasLabel("Attraction")
-    )
     if category:
-        t = t.has("category", category)
+        query = "MATCH (:City {name: $city})-[:HAS_ATTRACTION]->(a:Attraction {category: $category}) RETURN a"
+        params = {"city": city, "category": category}
+    else:
+        query = "MATCH (:City {name: $city})-[:HAS_ATTRACTION]->(a:Attraction) RETURN a"
+        params = {"city": city}
 
-    results = t.valueMap(True).toList()
-    attractions = [map_to_dict(a) for a in results]
+    rows = execute_query(query, params)
+    attractions = [extract_node(row, "a") for row in rows]
     result_str = json.dumps({"attractions": attractions, "count": len(attractions)}, ensure_ascii=False, default=str)
     _cache_set(cache_key, result_str, CACHE_TTL["get_attractions_by_city"])
     return result_str
@@ -286,19 +268,23 @@ def get_hotels_by_city(city: str, grade: str = "", has_onsen: bool = False) -> s
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
 
-    t = (
-        g.V().hasLabel("City").has("name", city)
-        .out("HAS_HOTEL").hasLabel("Hotel")
-    )
+    where_parts = []
+    params: dict = {"city": city}
+
     if grade:
-        t = t.has("grade", grade)
+        where_parts.append("h.grade = $grade")
+        params["grade"] = grade
     if has_onsen:
-        t = t.has("has_onsen", True)
+        where_parts.append("h.has_onsen = true")
 
-    results = t.valueMap(True).toList()
-    hotels = [map_to_dict(h) for h in results]
+    query = "MATCH (:City {name: $city})-[:HAS_HOTEL]->(h:Hotel)"
+    if where_parts:
+        query += " WHERE " + " AND ".join(where_parts)
+    query += " RETURN h"
+
+    rows = execute_query(query, params)
+    hotels = [extract_node(row, "h") for row in rows]
     result_str = json.dumps({"hotels": hotels, "count": len(hotels)}, ensure_ascii=False, default=str)
     _cache_set(cache_key, result_str, CACHE_TTL["get_hotels_by_city"])
     return result_str
@@ -334,37 +320,33 @@ def get_trends(region: str = "", country: str = "", city: str = "", min_score: i
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
 
-    # Build location filter
+    # Build location filter for the City node
+    params: dict = {"min_score": min_score}
     if city:
-        location_filter = __.out("LOCATED_IN").hasLabel("City").has("name", city)
+        city_filter = "{name: $location}"
+        params["location"] = city
     elif region:
-        location_filter = __.out("LOCATED_IN").hasLabel("City").has("region", region)
+        city_filter = "{region: $location}"
+        params["location"] = region
     elif country:
-        location_filter = __.out("LOCATED_IN").hasLabel("City").has("country", country)
+        city_filter = "{country: $location}"
+        params["location"] = country
     else:
-        location_filter = __.out("LOCATED_IN").hasLabel("City")
+        city_filter = ""
 
-    raw = (
-        g.V().hasLabel("Trend")
-        .has("virality_score", P.gte(min_score))
-        .where(
-            __.out("FILMED_AT", "FEATURES").where(location_filter)
-        )
-        .project("trend", "spots")
-        .by(__.valueMap(True))
-        .by(
-            __.out("FILMED_AT", "FEATURES")
-            .where(location_filter)
-            .valueMap(True).fold()
-        )
-        .toList()
+    query = (
+        f"MATCH (t:Trend)-[rel:FILMED_AT|FEATURES]->(ts:TrendSpot)-[:LOCATED_IN]->(c:City {city_filter}) "
+        f"WHERE t.virality_score >= $min_score "
+        f"WITH t, collect(DISTINCT ts) AS spots "
+        f"RETURN t, spots"
     )
+
+    raw = execute_query(query, params)
 
     trends = []
     for item in raw:
-        trend_data = map_to_dict(item["trend"])
+        trend_data = extract_node(item, "t")
         for field in ("keywords", "evidence"):
             if field in trend_data:
                 trend_data[field] = parse_json_field(trend_data[field])
@@ -381,7 +363,8 @@ def get_trends(region: str = "", country: str = "", city: str = "", min_score: i
         if effective < min_score:
             continue
 
-        spots = [map_to_dict(s) for s in item.get("spots", [])]
+        spots_raw = item.get("spots", [])
+        spots = [extract_node({"s": s}, "s") for s in spots_raw] if spots_raw else []
         tier = trend_data.get("tier") or _infer_tier(float(decay) if decay else 0.1)
         trends.append({
             "trend": {**trend_data, "tier": tier},
@@ -406,27 +389,23 @@ def get_similar_packages(package_code: str) -> str:
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
 
-    results = (
-        g.V().hasLabel("Package").has("code", package_code)
-        .outE("SIMILAR_TO")
-        .project("package", "score")
-        .by(__.inV().valueMap(True))
-        .by(__.values("score"))
-        .order().by(__.select("score"), Order.desc)
-        .limit(10).toList()
+    rows = execute_query(
+        "MATCH (:Package {code: $code})-[s:SIMILAR_TO]->(p2:Package) "
+        "RETURN p2, s.score AS score "
+        "ORDER BY s.score DESC LIMIT 10",
+        {"code": package_code},
     )
 
     packages = []
-    for r in results:
-        pkg = map_to_dict(r["package"])
+    for row in rows:
+        pkg = extract_node(row, "p2")
         for field in ("season", "hashtags", "guide_fee"):
             if field in pkg:
                 pkg[field] = parse_json_field(pkg[field])
         packages.append({
             "package": pkg,
-            "similarity_score": r.get("score", 0),
+            "similarity_score": row.get("score", 0),
         })
 
     result_str = json.dumps({"similar_packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
@@ -437,6 +416,32 @@ def get_similar_packages(package_code: str) -> str:
 # -------------------------------------------------------------------------
 # 8. get_nearby_cities
 # -------------------------------------------------------------------------
+def get_nearby_cities(city: str, max_km: int = 100) -> str:
+    """Find cities near the specified city within a maximum distance."""
+    cache_key = _make_cache_key("get_nearby_cities", city=city, max_km=max_km)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows = execute_query(
+        "MATCH (:City {name: $city})-[n:NEAR]->(c2:City) "
+        "WHERE n.distance_km <= $max_km "
+        "RETURN c2, n.distance_km AS distance_km "
+        "ORDER BY n.distance_km ASC",
+        {"city": city, "max_km": max_km},
+    )
+
+    cities = []
+    for row in rows:
+        city_data = extract_node(row, "c2")
+        city_data["distance_km"] = row.get("distance_km", 0)
+        cities.append(city_data)
+
+    result_str = json.dumps({"nearby_cities": cities, "count": len(cities)}, ensure_ascii=False, default=str)
+    _cache_set(cache_key, result_str, CACHE_TTL["get_nearby_cities"])
+    return result_str
+
+
 # -------------------------------------------------------------------------
 # 9. upsert_trend
 # -------------------------------------------------------------------------
@@ -457,41 +462,44 @@ def upsert_trend(
         evidence: List of evidence items, each with keys like:
             {"source": "youtube", "title": "...", "url": "...", "metric": "views: 1.2M"}
     """
-    g = get_connection()
-
     keywords_json = json.dumps(keywords or [], ensure_ascii=False)
     evidence_json = json.dumps(evidence or [], ensure_ascii=False)
+    resolved_tier = tier or _infer_tier(decay_rate)
+    updated_at = datetime.now(timezone.utc).isoformat()
 
-    result = (
-        g.V()
-        .hasLabel("Trend")
-        .has("title", title)
-        .has("source", source)
-        .fold()
-        .coalesce(
-            __.unfold(),
-            __.addV("Trend").property("title", title).property("source", source),
-        )
-        .property("type", type)
-        .property("date", date)
-        .property("virality_score", virality_score)
-        .property("decay_rate", decay_rate)
-        .property("keywords", keywords_json)
-        .property("evidence", evidence_json)
-        .property("tier", tier or _infer_tier(decay_rate))
-        .property("updated_at", datetime.now(timezone.utc).isoformat())
-        .valueMap(True)
-        .toList()
+    rows = execute_query(
+        "MERGE (t:Trend {title: $title, source: $source}) "
+        "ON CREATE SET t.type = $type, t.date = $date, "
+        "  t.virality_score = $virality_score, t.decay_rate = $decay_rate, "
+        "  t.keywords = $keywords, t.evidence = $evidence, "
+        "  t.tier = $tier, t.updated_at = $updated_at, t.created_at = $updated_at "
+        "ON MATCH SET t.type = $type, t.date = $date, "
+        "  t.virality_score = $virality_score, t.decay_rate = $decay_rate, "
+        "  t.keywords = $keywords, t.evidence = $evidence, "
+        "  t.tier = $tier, t.updated_at = $updated_at "
+        "RETURN t, t.created_at = t.updated_at AS is_new",
+        {
+            "title": title,
+            "source": source,
+            "type": type,
+            "date": date,
+            "virality_score": virality_score,
+            "decay_rate": decay_rate,
+            "keywords": keywords_json,
+            "evidence": evidence_json,
+            "tier": resolved_tier,
+            "updated_at": updated_at,
+        },
     )
 
-    if not result:
+    if not rows:
         return json.dumps({"error": "Failed to upsert trend"}, ensure_ascii=False)
 
-    trend = map_to_dict(result[0])
-    was_new = "created_at" not in trend or trend.get("updated_at") == trend.get("created_at")
+    trend = extract_node(rows[0], "t")
+    is_new = rows[0].get("is_new", False)
 
     return json.dumps(
-        {"trend_id": str(trend.get("id", "")), "status": "created" if was_new else "updated"},
+        {"trend_id": str(trend.get("id", "")), "status": "created" if is_new else "updated"},
         ensure_ascii=False,
     )
 
@@ -508,33 +516,35 @@ def upsert_trend_spot(
     photo_worthy: bool = False,
 ) -> str:
     """Upsert a TrendSpot vertex in Neptune."""
-    g = get_connection()
+    updated_at = datetime.now(timezone.utc).isoformat()
 
-    result = (
-        g.V()
-        .hasLabel("TrendSpot")
-        .has("name", name)
-        .fold()
-        .coalesce(
-            __.unfold(),
-            __.addV("TrendSpot").property("name", name),
-        )
-        .property("description", description)
-        .property("category", category)
-        .property("lat", lat)
-        .property("lng", lng)
-        .property("photo_worthy", photo_worthy)
-        .property("updated_at", datetime.now(timezone.utc).isoformat())
-        .valueMap(True)
-        .toList()
+    rows = execute_query(
+        "MERGE (ts:TrendSpot {name: $name}) "
+        "ON CREATE SET ts.description = $description, ts.category = $category, "
+        "  ts.lat = $lat, ts.lng = $lng, ts.photo_worthy = $photo_worthy, "
+        "  ts.updated_at = $updated_at, ts.created_at = $updated_at "
+        "ON MATCH SET ts.description = $description, ts.category = $category, "
+        "  ts.lat = $lat, ts.lng = $lng, ts.photo_worthy = $photo_worthy, "
+        "  ts.updated_at = $updated_at "
+        "RETURN ts, ts.created_at = ts.updated_at AS is_new",
+        {
+            "name": name,
+            "description": description,
+            "category": category,
+            "lat": lat,
+            "lng": lng,
+            "photo_worthy": photo_worthy,
+            "updated_at": updated_at,
+        },
     )
 
-    if not result:
+    if not rows:
         return json.dumps({"error": "Failed to upsert trend spot"}, ensure_ascii=False)
 
-    spot = map_to_dict(result[0])
+    spot = extract_node(rows[0], "ts")
+    is_new = rows[0].get("is_new", False)
     return json.dumps(
-        {"spot_id": str(spot.get("id", "")), "status": "created" if not description else "updated"},
+        {"spot_id": str(spot.get("id", "")), "status": "created" if is_new else "updated"},
         ensure_ascii=False,
     )
 
@@ -550,79 +560,50 @@ def link_trend_to_spot(
     city_name: str = "",
 ) -> str:
     """Link a Trend to a TrendSpot. Optionally link TrendSpot to City via LOCATED_IN."""
-    g = get_connection()
-
-    # Get Trend and TrendSpot vertices
-    trends = g.V().hasLabel("Trend").has("title", trend_title).has("source", trend_source).toList()
-    spots = g.V().hasLabel("TrendSpot").has("name", spot_name).toList()
-
-    if not trends:
-        return json.dumps({"error": f"Trend '{trend_title}' not found"}, ensure_ascii=False)
-    if not spots:
-        return json.dumps({"error": f"TrendSpot '{spot_name}' not found"}, ensure_ascii=False)
-
-    trend_v = trends[0]
-    spot_v = spots[0]
-
     # Validate edge_label
     if edge_label not in ("FILMED_AT", "FEATURES"):
         edge_label = "FEATURES"
 
-    # Create Trend → TrendSpot edge (idempotent)
-    existing_edge = (
-        g.V(trend_v).outE(edge_label).where(__.inV().is_(spot_v)).toList()
-    )
-    if not existing_edge:
-        g.V(trend_v).addE(edge_label).to(spot_v).next()
+    params = {"title": trend_title, "source": trend_source, "spot_name": spot_name}
 
-    # Link TrendSpot → City if city_name provided
+    # MERGE Trend -> TrendSpot edge (idempotent)
+    # Cypher does not allow parameterized relationship types, so we use if/else
+    if edge_label == "FILMED_AT":
+        query = (
+            "MATCH (t:Trend {title: $title, source: $source}) "
+            "MATCH (ts:TrendSpot {name: $spot_name}) "
+            "MERGE (t)-[:FILMED_AT]->(ts) "
+            "RETURN t, ts"
+        )
+    else:
+        query = (
+            "MATCH (t:Trend {title: $title, source: $source}) "
+            "MATCH (ts:TrendSpot {name: $spot_name}) "
+            "MERGE (t)-[:FEATURES]->(ts) "
+            "RETURN t, ts"
+        )
+
+    rows = execute_query(query, params)
+    if not rows:
+        return json.dumps(
+            {"error": f"Trend '{trend_title}' or TrendSpot '{spot_name}' not found"},
+            ensure_ascii=False,
+        )
+
+    # Link TrendSpot -> City if city_name provided
     if city_name:
-        cities = g.V().hasLabel("City").has("name", city_name).toList()
-        if cities:
-            city_v = cities[0]
-            existing_loc = (
-                g.V(spot_v).outE("LOCATED_IN").where(__.inV().is_(city_v)).toList()
-            )
-            if not existing_loc:
-                g.V(spot_v).addE("LOCATED_IN").to(city_v).next()
+        execute_query(
+            "MATCH (ts:TrendSpot {name: $spot_name}) "
+            "MATCH (c:City {name: $city_name}) "
+            "MERGE (ts)-[:LOCATED_IN]->(c)",
+            {"spot_name": spot_name, "city_name": city_name},
+        )
 
     return json.dumps({"status": "linked"}, ensure_ascii=False)
 
 
 # -------------------------------------------------------------------------
-# 12. get_nearby_cities
-# -------------------------------------------------------------------------
-def get_nearby_cities(city: str, max_km: int = 100) -> str:
-    """Find cities near the specified city within a maximum distance."""
-    cache_key = _make_cache_key("get_nearby_cities", city=city, max_km=max_km)
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-    g = get_connection()
-
-    results = (
-        g.V().hasLabel("City").has("name", city)
-        .outE("NEAR").has("distance_km", P.lte(max_km))
-        .project("city", "distance_km")
-        .by(__.inV().valueMap(True))
-        .by(__.values("distance_km"))
-        .order().by(__.select("distance_km"), Order.asc)
-        .toList()
-    )
-
-    cities = []
-    for r in results:
-        city_data = map_to_dict(r["city"])
-        city_data["distance_km"] = r.get("distance_km", 0)
-        cities.append(city_data)
-
-    result_str = json.dumps({"nearby_cities": cities, "count": len(cities)}, ensure_ascii=False, default=str)
-    _cache_set(cache_key, result_str, CACHE_TTL["get_nearby_cities"])
-    return result_str
-
-
-# -------------------------------------------------------------------------
-# 13. get_cities_by_country
+# 12. get_cities_by_country
 # -------------------------------------------------------------------------
 def get_cities_by_country(country: str) -> str:
     """Get all cities for a country from the Knowledge Graph."""
@@ -630,29 +611,19 @@ def get_cities_by_country(country: str) -> str:
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    g = get_connection()
-    results = (
-        g.V().hasLabel("City").has("country", country)
-        .valueMap("name", "region").toList()
+
+    rows = execute_query(
+        "MATCH (c:City {country: $country}) RETURN c.name AS name, c.region AS region",
+        {"country": country},
     )
-    cities = []
-    for r in results:
-        d = map_to_dict(r)
-        name = d.get("name")
-        if isinstance(name, list):
-            name = name[0]
-        region = d.get("region")
-        if isinstance(region, list):
-            region = region[0]
-        if name:
-            cities.append({"name": name, "region": region})
+    cities = [{"name": row["name"], "region": row.get("region")} for row in rows if row.get("name")]
     result_str = json.dumps({"country": country, "cities": cities, "count": len(cities)}, ensure_ascii=False)
     _cache_set(cache_key, result_str, CACHE_TTL["get_cities_by_country"])
     return result_str
 
 
 # -------------------------------------------------------------------------
-# 14. invalidate_cache
+# 13. invalidate_cache
 # -------------------------------------------------------------------------
 _redis_client = None
 

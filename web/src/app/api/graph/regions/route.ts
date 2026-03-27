@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getTraversal, mapToObject } from "@/lib/gremlin";
+import { executeQuery, extractNode } from "@/lib/neptune";
 import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 
 const CACHE_KEY = "regions";
@@ -13,24 +13,14 @@ export async function GET() {
   if (cached) return NextResponse.json(cached);
 
   try {
-    const g = await getTraversal();
+    const results = await executeQuery(
+      "MATCH (r:Region) RETURN r"
+    );
 
-    const results = await g
-      .V()
-      .hasLabel("Region")
-      .valueMap(true)
-      .toList();
-
-    const regions = results.map((r: unknown) => {
-      const obj = mapToObject<Record<string, unknown>>(
-        r as Map<string, unknown>
-      );
-      const val = (key: string): unknown => {
-        const v = obj[key];
-        return Array.isArray(v) ? v[0] : v;
-      };
+    const regions = results.map((row) => {
+      const obj = extractNode(row as Record<string, unknown>, "r");
       return {
-        name: String(val("name") || ""),
+        name: String(obj.name || ""),
       };
     });
 

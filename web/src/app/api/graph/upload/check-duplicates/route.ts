@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTraversal } from "@/lib/gremlin";
+import { executeQuery } from "@/lib/neptune";
 
 /**
  * POST /api/graph/upload/check-duplicates
@@ -19,7 +19,6 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ existingValues: [] });
     }
 
-    const g = await getTraversal();
     const existingValues: string[] = [];
 
     // Check in batches of 100
@@ -28,14 +27,14 @@ export async function POST(request: NextRequest) {
       const batch = values.slice(i, i + batchSize);
       const vertexIds = batch.map((v) => `${nodeLabel}:${v}`);
 
-      const results = await g
-        .V(...vertexIds)
-        .id()
-        .toList();
+      const results = await executeQuery<{ nodeId: string }>(
+        "MATCH (n) WHERE id(n) IN $ids RETURN id(n) AS nodeId",
+        { ids: vertexIds }
+      );
 
-      for (const id of results) {
-        const idStr = String(id);
-        const prefix = `${nodeLabel}:`;
+      const prefix = `${nodeLabel}:`;
+      for (const row of results) {
+        const idStr = String(row.nodeId);
         if (idStr.startsWith(prefix)) {
           existingValues.push(idStr.slice(prefix.length));
         }

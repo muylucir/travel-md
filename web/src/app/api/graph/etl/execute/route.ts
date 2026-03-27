@@ -7,71 +7,61 @@ import {
   triggerLoad,
   isBulkLoaderAvailable,
 } from "@/lib/neptune-loader";
-import { getTraversal } from "@/lib/gremlin";
+import { executeQuery } from "@/lib/neptune";
 
 const DELETE_BATCH = 500;
 const DEFAULT_BATCH_SIZE = 100;
 
 /**
  * 특정 label의 vertex와 연결된 edge를 모두 삭제한다.
- * Neptune은 iterate()를 지원하지 않으므로 batch loop로 처리.
+ * Label은 Cypher에서 파라미터화할 수 없으므로 직접 삽입 (검증 필수).
  */
 async function dropVerticesByLabel(label: string): Promise<{
   deletedVertices: number;
   deletedEdges: number;
 }> {
-  const g = await getTraversal();
+  // Validate label to prevent injection
+  if (!/^[A-Za-z0-9_]+$/.test(label)) {
+    throw new Error(`Invalid label: ${label}`);
+  }
 
-  // 삭제 전 카운트
-  const vCount = Number((await g.V().hasLabel(label).count().next()).value);
+  // Count before deletion
+  const [vCountRow] = await executeQuery<{ cnt: number }>(
+    `MATCH (n:${label}) RETURN count(n) AS cnt`
+  );
+  const vCount = Number(vCountRow?.cnt ?? 0);
 
-  // 해당 label vertex에 연결된 edge 삭제
+  // Delete edges connected to vertices of this label
   let hasMore = true;
   let deletedEdges = 0;
   while (hasMore) {
-    const edges = await g
-      .V()
-      .hasLabel(label)
-      .bothE()
-      .limit(DELETE_BATCH)
-      .count()
-      .next();
-    const count = Number(edges.value);
+    const [countRow] = await executeQuery<{ cnt: number }>(
+      `MATCH (n:${label})-[r]-() RETURN count(r) AS cnt`
+    );
+    const count = Number(countRow?.cnt ?? 0);
     if (count === 0) {
       hasMore = false;
     } else {
-      await g
-        .V()
-        .hasLabel(label)
-        .bothE()
-        .limit(DELETE_BATCH)
-        .drop()
-        .fold()
-        .next();
-      deletedEdges += count;
+      await executeQuery(
+        `MATCH (n:${label})-[r]-() WITH r LIMIT ${DELETE_BATCH} DELETE r`
+      );
+      deletedEdges += Math.min(count, DELETE_BATCH);
     }
   }
 
-  // vertex 삭제
+  // Delete vertices
   hasMore = true;
   while (hasMore) {
-    const verts = await g
-      .V()
-      .hasLabel(label)
-      .limit(DELETE_BATCH)
-      .count()
-      .next();
-    const count = Number(verts.value);
+    const [countRow] = await executeQuery<{ cnt: number }>(
+      `MATCH (n:${label}) RETURN count(n) AS cnt`
+    );
+    const count = Number(countRow?.cnt ?? 0);
     if (count === 0) {
       hasMore = false;
     } else {
-      await g
-        .V()
-        .hasLabel(label)
-        .limit(DELETE_BATCH)
-        .drop()
-        .fold()
-        .next();
+      await executeQuery(
+        `MATCH (n:${label}) WITH n LIMIT ${DELETE_BATCH} DETACH DELETE n`
+      );
     }
   }
 
@@ -86,7 +76,7 @@ async function dropVerticesByLabel(label: string): Promise<{
  *
  * 동작:
  *   1. 해당 label의 기존 vertex + edge 삭제
- *   2. 100건 이상: Bulk Loader / 미만: Gremlin 순차 적재
+ *   2. 100건 이상: Bulk Loader / 미만: OpenCypher 순차 적재
  */
 export async function POST(request: NextRequest) {
   try {
@@ -159,7 +149,7 @@ export async function POST(request: NextRequest) {
         deleteResult,
       });
     } else {
-      // ── Gremlin 순차 적재 경로 ──
+      // ── OpenCypher 순차 적재 경로 ──
       const uploadUrl = new URL("/api/graph/upload", request.url);
       const uploadRes = await fetch(uploadUrl, {
         method: "POST",
@@ -175,7 +165,7 @@ export async function POST(request: NextRequest) {
       const uploadResult = await uploadRes.json();
 
       return NextResponse.json({
-        mode: "gremlin",
+        mode: "opencypher",
         ...uploadResult,
         totalCount,
         deleteResult,

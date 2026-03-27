@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getTraversal } from "@/lib/gremlin";
+import { executeQuery } from "@/lib/neptune";
 import { cacheInvalidate } from "@/lib/api-cache";
 
 /**
@@ -17,32 +17,40 @@ export async function DELETE(request: Request) {
       );
     }
 
-    const g = await getTraversal();
-
     // Count before deletion
-    const nodeCount = await g.V().count().next();
-    const edgeCount = await g.E().count().next();
-    const beforeNodes = Number(nodeCount.value);
-    const beforeEdges = Number(edgeCount.value);
+    const [nodeResult] = await executeQuery<{ cnt: number }>(
+      "MATCH (n) RETURN count(n) AS cnt"
+    );
+    const [edgeResult] = await executeQuery<{ cnt: number }>(
+      "MATCH ()-[r]->() RETURN count(r) AS cnt"
+    );
+    const beforeNodes = Number(nodeResult?.cnt ?? 0);
+    const beforeEdges = Number(edgeResult?.cnt ?? 0);
 
-    // Neptune doesn't support iterate() (discard operator).
-    // Delete in batches using limit + drop + next loop.
     const BATCH = 500;
 
     // Drop edges in batches
     let hasMore = true;
     while (hasMore) {
-      await g.E().limit(BATCH).drop().fold().next();
-      const remaining = await g.E().limit(1).count().next();
-      hasMore = Number(remaining.value) > 0;
+      await executeQuery(
+        `MATCH ()-[r]->() WITH r LIMIT ${BATCH} DELETE r`
+      );
+      const [rem] = await executeQuery<{ cnt: number }>(
+        "MATCH ()-[r]->() RETURN count(r) AS cnt"
+      );
+      hasMore = Number(rem?.cnt ?? 0) > 0;
     }
 
     // Drop vertices in batches
     hasMore = true;
     while (hasMore) {
-      await g.V().limit(BATCH).drop().fold().next();
-      const remaining = await g.V().limit(1).count().next();
-      hasMore = Number(remaining.value) > 0;
+      await executeQuery(
+        `MATCH (n) WITH n LIMIT ${BATCH} DETACH DELETE n`
+      );
+      const [rem] = await executeQuery<{ cnt: number }>(
+        "MATCH (n) RETURN count(n) AS cnt"
+      );
+      hasMore = Number(rem?.cnt ?? 0) > 0;
     }
 
     // Invalidate all graph caches
