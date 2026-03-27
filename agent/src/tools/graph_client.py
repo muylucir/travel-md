@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import boto3
@@ -24,7 +25,11 @@ def get_client():
     global _client
     if _client is None:
         logger.info("Creating Neptune OpenCypher client for %s", NEPTUNE_ENDPOINT)
-        _client = boto3.client("neptunedata", endpoint_url=NEPTUNE_ENDPOINT)
+        _client = boto3.client(
+            "neptunedata",
+            endpoint_url=NEPTUNE_ENDPOINT,
+            region_name=os.environ.get("AWS_REGION", "ap-northeast-2"),
+        )
     return _client
 
 

@@ -35,11 +35,25 @@ import boto3
 _client = None
 
 
+def _extract_region(hostname: str) -> str:
+    """Neptune 호스트명에서 리전 추출. 예: xxx.ap-northeast-2.neptune.amazonaws.com -> ap-northeast-2"""
+    parts = hostname.split(".")
+    for i, p in enumerate(parts):
+        if p == "neptune":
+            return parts[i - 1]
+    return os.environ.get("AWS_REGION", "ap-northeast-2")
+
+
 def get_client(endpoint: str):
     """Return a cached boto3 neptunedata client."""
     global _client
     if _client is None:
-        _client = boto3.client("neptunedata", endpoint_url=f"https://{endpoint}:8182")
+        region = _extract_region(endpoint)
+        _client = boto3.client(
+            "neptunedata",
+            endpoint_url=f"https://{endpoint}:8182",
+            region_name=region,
+        )
     return _client
 
 
