@@ -4,81 +4,153 @@ import { cacheGet, cacheSet, TTL } from "@/lib/api-cache";
 
 /**
  * GET /api/packages/[code]
- * Get a single package by code, including related entities
- * (cities, attractions, hotels, routes, themes).
+ *
+ * v3 SaleProduct 상세 조회. Lambda graph_tools.get_package 와 동일한 모양:
+ *   { saleProduct, arrivalCity, visitCities, attractions[], hotelStays[],
+ *     flightSegments[], brand }
+ *
+ * UI 의 비교 패널 (기준 상품) 데이터 소스로 사용.
  */
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ code: string }> }
 ) {
+  const { code } = await params;
+  if (!code) {
+    return NextResponse.json({ error: "saleProdCd is required" }, { status: 400 });
+  }
+
+  const cacheKey = `package:v3:${code}`;
+  const cached = cacheGet<unknown>(cacheKey);
+  if (cached) return NextResponse.json(cached);
+
   try {
-    const { code } = await params;
-
-    const cacheKey = `pkg-detail:${code}`;
-    const cached = cacheGet<Record<string, unknown>>(cacheKey);
-    if (cached) return NextResponse.json(cached);
-
-    // Fetch package node
-    const packageResults = await executeQuery(
-      "MATCH (p:Package {code: $code}) RETURN p",
+    // SaleProduct
+    const pkgRows = await executeQuery(
+      "MATCH (p:SaleProduct {saleProdCd: $code}) RETURN p",
       { code }
     );
-
-    if (packageResults.length === 0) {
+    if (pkgRows.length === 0) {
       return NextResponse.json(
-        { error: `패키지 '${code}'를 찾을 수 없습니다.` },
+        { error: `SaleProduct '${code}' not found` },
         { status: 404 }
       );
     }
+    const saleProduct = extractNode(pkgRows[0] as Record<string, unknown>, "p");
 
-    const pkg = extractNode(packageResults[0] as Record<string, unknown>, "p");
-
-    // Fetch related cities
-    const cityResults = await executeQuery(
-      "MATCH (:Package {code: $code})-[:VISITS]->(c:City) RETURN DISTINCT c",
+    // VISITS_CITY
+    const visitRows = await executeQuery(
+      "MATCH (p:SaleProduct {saleProdCd: $code})-[v:VISITS_CITY]->(c:City) " +
+        "RETURN c, v.source AS source",
       { code }
     );
-    const cities = cityResults.map((row) =>
-      extractNode(row as Record<string, unknown>, "c")
-    );
+    const visitCities = visitRows.map((row) => {
+      const r = row as Record<string, unknown>;
+      const c = extractNode(r, "c");
+      c.source = r.source;
+      return c;
+    });
 
-    // Fetch related attractions
-    const attractionResults = await executeQuery(
-      "MATCH (:Package {code: $code})-[:INCLUDES]->(a:Attraction) RETURN DISTINCT a",
+    // ARRIVES_IN
+    const arrRows = await executeQuery(
+      "MATCH (p:SaleProduct {saleProdCd: $code})-[:ARRIVES_IN]->(c:City) RETURN c",
       { code }
     );
-    const attractions = attractionResults.map((row) =>
-      extractNode(row as Record<string, unknown>, "a")
-    );
+    const arrivalCity =
+      arrRows.length > 0
+        ? extractNode(arrRows[0] as Record<string, unknown>, "c")
+        : null;
 
-    // Fetch related hotels
-    const hotelResults = await executeQuery(
-      "MATCH (:Package {code: $code})-[:INCLUDES_HOTEL|STAYS_AT]->(h:Hotel) RETURN DISTINCT h",
+    // HAS_SCHEDULED_ATTRACTION (multigraph: schdDay, schtExprSqc)
+    const attrRows = await executeQuery(
+      "MATCH (p:SaleProduct {saleProdCd: $code})-[r:HAS_SCHEDULED_ATTRACTION]->(a:Attraction) " +
+        "RETURN a, r.schdDay AS schdDay, r.schtExprSqc AS schtExprSqc " +
+        "ORDER BY r.schdDay, r.schtExprSqc",
       { code }
     );
-    const hotels = hotelResults.map((row) =>
-      extractNode(row as Record<string, unknown>, "h")
-    );
+    const attractions = attrRows.map((row) => {
+      const r = row as Record<string, unknown>;
+      const a = extractNode(r, "a");
+      a.schdDay = r.schdDay;
+      a.schtExprSqc = r.schtExprSqc;
+      return a;
+    });
 
-    // Fetch related routes (flights)
-    const routeResults = await executeQuery(
-      "MATCH (:Package {code: $code})-[:DEPARTS_ON]->(r:Route) RETURN DISTINCT r",
+    // HAS_HOTEL_STAY → MATCHED_TO Hotel
+    const stayRows = await executeQuery(
+      "MATCH (p:SaleProduct {saleProdCd: $code})-[hs:HAS_HOTEL_STAY]->(s:HotelStay) " +
+        "OPTIONAL MATCH (s)-[:MATCHED_TO]->(h:Hotel) " +
+        "RETURN s, h, hs.schdDay AS schdDay " +
+        "ORDER BY hs.schdDay",
       { code }
     );
-    const routes = routeResults.map((row) =>
-      extractNode(row as Record<string, unknown>, "r")
-    );
+    const hotelStays = stayRows.map((row) => {
+      const r = row as Record<string, unknown>;
+      const stay = extractNode(r, "s");
+      const h = r.h;
+      if (
+        h &&
+        typeof h === "object" &&
+        (h as Record<string, unknown>)["~properties"]
+      ) {
+        stay.hotel = extractNode(r, "h");
+      } else {
+        stay.hotel = null;
+      }
+      stay.schdDay = r.schdDay;
+      return stay;
+    });
 
-    // Fetch themes
-    const themeResults = await executeQuery(
-      "MATCH (:Package {code: $code})-[:TAGGED|HAS_THEME]->(t:Theme) RETURN DISTINCT t",
+    // HAS_FLIGHT_SEGMENT
+    const segRows = await executeQuery(
+      "MATCH (p:SaleProduct {saleProdCd: $code})-[:HAS_FLIGHT_SEGMENT]->(f:FlightSegment) " +
+        "OPTIONAL MATCH (f)-[:DEPARTS_FROM_AIRPORT]->(da:Airport) " +
+        "OPTIONAL MATCH (f)-[:ARRIVES_AT_AIRPORT]->(aa:Airport) " +
+        "RETURN f, da, aa ORDER BY f.segReq",
       { code }
     );
-    const themes = themeResults.map((row) =>
-      extractNode(row as Record<string, unknown>, "t")
-    );
+    const flightSegments = segRows.map((row) => {
+      const r = row as Record<string, unknown>;
+      const seg = extractNode(r, "f");
+      const da = r.da;
+      const aa = r.aa;
+      if (
+        da &&
+        typeof da === "object" &&
+        (da as Record<string, unknown>)["~properties"]
+      ) {
+        seg.depAirport = extractNode(r, "da");
+      }
+      if (
+        aa &&
+        typeof aa === "object" &&
+        (aa as Record<string, unknown>)["~properties"]
+      ) {
+        seg.arrAirport = extractNode(r, "aa");
+      }
+      return seg;
+    });
 
-    const result = { package: pkg, cities, attractions, hotels, routes, themes };
+    // HAS_BRAND
+    const brandRows = await executeQuery(
+      "MATCH (p:SaleProduct {saleProdCd: $code})-[:HAS_BRAND]->(b:Brand) RETURN b",
+      { code }
+    );
+    const brand =
+      brandRows.length > 0
+        ? extractNode(brandRows[0] as Record<string, unknown>, "b")
+        : null;
+
+    const result = {
+      saleProduct,
+      arrivalCity,
+      visitCities,
+      attractions,
+      hotelStays,
+      flightSegments,
+      brand,
+    };
+
     cacheSet(cacheKey, result, TTL.SEMI_STATIC);
     return NextResponse.json(result);
   } catch (error) {

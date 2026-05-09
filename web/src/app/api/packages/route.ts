@@ -5,139 +5,123 @@ import type { PackageNode } from "@/lib/types";
 
 /**
  * GET /api/packages
- * List packages from Neptune via OpenCypher.
+ *
+ * v3 SaleProduct 검색.
  *
  * Query params:
- *   destination - filter by region/destination
- *   theme       - filter by theme tag
- *   season      - filter by season
- *   nights      - filter by number of nights
- *   limit       - max results (default 100)
+ *   destination     - 도시 이름 또는 코드 (오사카 / OSA)
+ *                     ARRIVES_IN 또는 VISITS_CITY 매칭
+ *   theme_key       - v3 Theme.key (e.g. FAMILY_WITH_KIDS) — 일정에 해당
+ *                     테마 가중치(IN_THEME.weight>0)가 있는 명소를 포함하는
+ *                     SaleProduct만 반환
+ *   season_quarter  - 1..4 (Season.quarter)
+ *   nights          - trvlNgtCnt
+ *   brand           - "세이브" | "스탠다드"
+ *   limit           - max results (default 20)
  */
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const destination = searchParams.get("destination");
-  const theme = searchParams.get("theme");
-  const season = searchParams.get("season");
-  const nights = searchParams.get("nights");
-  const limit = parseInt(searchParams.get("limit") || "100", 10);
+  const destination = searchParams.get("destination") || "";
+  const themeKey = searchParams.get("theme_key") || searchParams.get("theme") || "";
+  const seasonQuarterStr = searchParams.get("season_quarter") || "";
+  const nights = searchParams.get("nights") || "";
+  const brand = searchParams.get("brand") || "";
+  const limit = parseInt(searchParams.get("limit") || "20", 10);
 
-  const cacheKey = `packages:${destination || ""}:${theme || ""}:${season || ""}:${nights || ""}:${limit}`;
+  const cacheKey = `packages:v3:${destination}:${themeKey}:${seasonQuarterStr}:${nights}:${brand}:${limit}`;
   const cached = cacheGet<PackageNode[]>(cacheKey);
   if (cached) return NextResponse.json(cached);
 
   try {
-    const matchParts = ["MATCH (p:Package)"];
+    // 1) 필수 MATCH 절을 먼저 모은다 (mandatory matches 만)
+    const matchLines = ["MATCH (p:SaleProduct)"];
     const whereParts: string[] = [];
     const params: Record<string, unknown> = {};
 
+    if (nights) {
+      const n = parseInt(nights, 10);
+      if (!isNaN(n)) {
+        whereParts.push("p.trvlNgtCnt = $nights");
+        params.nights = n;
+      }
+    }
+
+    if (brand) {
+      whereParts.push("p.brndNm = $brand");
+      params.brand = brand;
+    }
+
+    if (themeKey) {
+      matchLines.push(
+        "MATCH (p)-[:HAS_SCHEDULED_ATTRACTION]->(:Attraction)-[it:IN_THEME]->(:Theme {key: $theme_key})"
+      );
+      whereParts.push("it.weight > 0");
+      params.theme_key = themeKey;
+    }
+
+    const seasonQuarter = parseInt(seasonQuarterStr, 10);
+    if (!isNaN(seasonQuarter) && seasonQuarter >= 1 && seasonQuarter <= 4) {
+      matchLines.push(
+        "MATCH (p)-[:HAS_SCHEDULED_ATTRACTION]->(:Attraction)-[bs:BEST_IN_SEASON]->(:Season {quarter: $q})"
+      );
+      whereParts.push("bs.weight > 0");
+      params.q = seasonQuarter;
+    }
+
+    // 2) destination 매칭은 ARRIVES_IN(SaleProduct.arrCityNm/arrCityCd) 또는
+    //    VISITS_CITY 둘 중 하나에 걸리면 OK. OpenCypher 는 OPTIONAL MATCH 다음
+    //    MATCH 와 EXISTS{...} 서브쿼리를 모두 거부하므로, WHERE 절의 pattern
+    //    expression `(p)-[:VISITS_CITY]->(:City {...})` 를 사용한다 (Neptune 지원).
     if (destination) {
-      matchParts[0] = "MATCH (p:Package)-[:VISITS]->(c:City)";
-      whereParts.push("(c.name = $dest OR c.region = $dest OR c.country = $dest)");
+      whereParts.push(
+        "(p.arrCityNm = $dest OR p.arrCityCd = $dest OR " +
+          "(p)-[:VISITS_CITY]->(:City {name: $dest}) OR " +
+          "(p)-[:VISITS_CITY]->(:City {code: $dest}))"
+      );
       params.dest = destination;
     }
 
-    if (theme) {
-      matchParts.push("MATCH (p)-[:TAGGED]->(th:Theme {name: $theme})");
-      params.theme = theme;
-    }
-
-    if (season) {
-      whereParts.push("p.season CONTAINS $season");
-      params.season = season;
-    }
-
-    if (nights) {
-      whereParts.push("p.nights = $nights");
-      params.nights = parseInt(nights, 10);
-    }
-
-    let query = matchParts.join("\n");
+    let query = matchLines.join("\n");
     if (whereParts.length > 0) {
       query += "\nWHERE " + whereParts.join(" AND ");
     }
-    query += `\nRETURN DISTINCT p ORDER BY p.rating DESC LIMIT ${limit}`;
+    query += `\nRETURN DISTINCT p LIMIT ${limit}`;
 
     const rows = await executeQuery(query, params);
 
     const packages: PackageNode[] = rows.map((row) => {
-      const props = extractNode(row as Record<string, unknown>, "p");
-      return normalizePackage(props);
+      const props = extractNode(row as Record<string, unknown>, "p") as Record<
+        string,
+        unknown
+      >;
+      const code = String(props.saleProdCd || "");
+      const arrCity = String(props.arrCityNm || "");
+      const visitCsv = String(props.vistCityRawCsv || "");
+      const trvlDay = Number(props.trvlDayCnt || 0);
+      const trvlNgt = Number(props.trvlNgtCnt || 0);
+      return {
+        code,
+        name: String(props.saleProdNm || code),
+        description: String(props.prodSbttNm || ""),
+        price: 0, // v3 SaleProduct 에 가격 속성 없음
+        nights: trvlNgt,
+        days: trvlDay,
+        rating: 0, // v3 SaleProduct 에 rating 속성 없음
+        season: [],
+        hashtags: [],
+        travel_cities: visitCsv ? `${arrCity} (${visitCsv})` : arrCity,
+        // v3 추가 컨텍스트
+        brand: String(props.brndNm || ""),
+      } as PackageNode & { brand: string };
     });
-
-    // Batch-fetch travel cities for each package via VISITS edges
-    const packageCodes = packages.map((p) => p.code).filter(Boolean);
-    if (packageCodes.length > 0) {
-      try {
-        const cityRows = await executeQuery<{ code: string; cities: string[] }>(
-          "MATCH (p:Package)-[:VISITS]->(c:City) " +
-          "WHERE p.code IN $codes " +
-          "RETURN p.code AS code, collect(DISTINCT c.name) AS cities",
-          { codes: packageCodes }
-        );
-
-        const cityMap = new Map<string, string>();
-        for (const row of cityRows) {
-          if (row.code && Array.isArray(row.cities) && row.cities.length > 0) {
-            cityMap.set(row.code, row.cities.join(", "));
-          }
-        }
-
-        for (const pkg of packages) {
-          const cities = cityMap.get(pkg.code);
-          if (cities) {
-            pkg.travel_cities = cities;
-          }
-        }
-      } catch (cityErr) {
-        console.warn("[/api/packages] City lookup failed:", cityErr);
-      }
-    }
 
     cacheSet(cacheKey, packages, TTL.SEMI_STATIC);
     return NextResponse.json(packages);
   } catch (error) {
     console.error("[/api/packages] Error:", error);
     return NextResponse.json(
-      { error: "패키지 목록 조회 중 오류가 발생했습니다." },
+      { error: "패키지 조회 중 오류가 발생했습니다." },
       { status: 500 }
     );
   }
-}
-
-function normalizePackage(props: Record<string, unknown>): PackageNode {
-  const val = (key: string): unknown => props[key];
-
-  const arrVal = (key: string): string[] => {
-    const v = props[key];
-    if (Array.isArray(v)) return v.map(String);
-    if (typeof v === "string") {
-      try {
-        const parsed = JSON.parse(v);
-        return Array.isArray(parsed) ? parsed : [v];
-      } catch {
-        return [v];
-      }
-    }
-    return [];
-  };
-
-  return {
-    code: String(val("code") || ""),
-    name: String(val("name") || ""),
-    description: val("description") as string | undefined,
-    price: Number(val("price")) || 0,
-    nights: Number(val("nights")) || 0,
-    days: Number(val("days")) || 0,
-    rating: Number(val("rating")) || 0,
-    review_count: Number(val("review_count")) || 0,
-    season: arrVal("season"),
-    product_line: val("product_line") as string | undefined,
-    hashtags: arrVal("hashtags"),
-    shopping_count: Number(val("shopping_count")) || 0,
-    has_escort: Boolean(val("has_escort")),
-    meal_included: val("meal_included") as string | undefined,
-    optional_tour: Boolean(val("optional_tour")),
-    source_url: val("source_url") as string | undefined,
-  };
 }

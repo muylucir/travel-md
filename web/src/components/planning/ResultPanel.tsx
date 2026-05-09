@@ -9,6 +9,8 @@ import Badge from "@cloudscape-design/components/badge";
 import Table from "@cloudscape-design/components/table";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
 import ItineraryCard from "./ItineraryCard";
+import ComparisonPanel from "./ComparisonPanel";
+import GraphTracePanel from "./GraphTracePanel";
 import type { PlanningOutput } from "@/lib/types";
 
 interface ResultPanelProps {
@@ -16,8 +18,24 @@ interface ResultPanelProps {
 }
 
 export default function ResultPanel({ result }: ResultPanelProps) {
+  // 기준 상품 코드 — reference_products[0] 우선, 없으면 표시 안 함
+  const referenceCode =
+    result.reference_products && result.reference_products.length > 0
+      ? result.reference_products[0]
+      : "";
+
   return (
     <SpaceBetween size="l">
+      {/* Comparison vs reference (only when reference_products is set) */}
+      {referenceCode && (
+        <ComparisonPanel result={result} referenceCode={referenceCode} />
+      )}
+
+      {/* Graph trace (Knowledge Graph 탐색 내역) */}
+      {result.graph_trace && result.graph_trace.length > 0 && (
+        <GraphTracePanel trace={result.graph_trace} />
+      )}
+
       {/* Product Header */}
       <Container
         header={
@@ -257,8 +275,18 @@ export default function ResultPanel({ result }: ResultPanelProps) {
       <ExpandableSection headerText="패키지 특성" variant="container">
         <ColumnLayout columns={3} variant="text-grid">
           <div>
-            <Box variant="awsui-key-label">쇼핑 횟수</Box>
-            <Box variant="p">{result.shopping_count}회</Box>
+            <Box variant="awsui-key-label">브랜드</Box>
+            <Box variant="p">
+              {result.brand
+                ? `${result.brand}${
+                    result.brand === "세이브"
+                      ? " (쇼핑 포함)"
+                      : result.brand === "스탠다드"
+                        ? " (쇼핑 미포함)"
+                        : ""
+                  }`
+                : "-"}
+            </Box>
           </div>
           <div>
             <Box variant="awsui-key-label">가이드/기사 경비</Box>
@@ -306,18 +334,6 @@ export default function ResultPanel({ result }: ResultPanelProps) {
                 </SpaceBetween>
               </div>
             )}
-            {result.changes_summary.trend_added?.length > 0 && (
-              <div>
-                <Box variant="awsui-key-label">트렌드 추가</Box>
-                <SpaceBetween size="xs">
-                  {result.changes_summary.trend_added.map((item, idx) => (
-                    <Box key={idx} variant="p" color="text-status-info">
-                      {item}
-                    </Box>
-                  ))}
-                </SpaceBetween>
-              </div>
-            )}
             <ColumnLayout columns={2}>
               <div>
                 <Box variant="awsui-key-label">적용 유사도</Box>
@@ -346,16 +362,8 @@ export default function ResultPanel({ result }: ResultPanelProps) {
           <div>
             <Box variant="awsui-key-label">참고 상품</Box>
             <Box variant="p">
-              {result.reference_products?.length > 0
+              {result.reference_products && result.reference_products.length > 0
                 ? result.reference_products.join(", ")
-                : "없음"}
-            </Box>
-          </div>
-          <div>
-            <Box variant="awsui-key-label">트렌드 소스</Box>
-            <Box variant="p">
-              {result.trend_sources?.length > 0
-                ? result.trend_sources.join(", ")
                 : "없음"}
             </Box>
           </div>

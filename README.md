@@ -31,16 +31,16 @@
 │  Cloudscape Design System · React 19 · TypeScript               │
 │  /api/planning → AgentCore | /api/graph/* → Neptune 직접 조회   │
 └──────────┬──────────────────────────────────┬───────────────────┘
-           │ SigV4                            │ Gremlin WSS
+           │ SigV4                            │ OpenCypher HTTPS
            ▼                                  ▼
 ┌──────────────────┐                 ┌─────────────────┐
 │ AgentCore        │                 │ Amazon Neptune   │
-│ Runtime (PUBLIC) │                 │ Serverless       │
+│ Runtime (PUBLIC) │                 │ Serverless 1.4.7 │
 │                  │                 │ (Knowledge Graph)│
 │ Travel Agent     │                 └─────────────────┘
 │ Trend Collector  │                          ▲
 └────────┬─────────┘                          │
-         │ MCP (SigV4)                        │ Gremlin
+         │ MCP (SigV4)                        │ OpenCypher
          ▼                                    │
 ┌─────────────────────────────────────────────┴───────────────────┐
 │ AgentCore Gateway (AWS_IAM)                                     │
@@ -64,7 +64,7 @@
 | **AI Agent** | [Strands Agents SDK](https://github.com/strands-agents/sdk-python), Claude Opus 4.6 / Sonnet 4.6 |
 | **Agent 배포** | Amazon Bedrock AgentCore Runtime (PUBLIC) |
 | **도구 연결** | AgentCore Gateway (MCP Protocol, AWS_IAM) |
-| **Graph DB** | Amazon Neptune Serverless (Gremlin) |
+| **Graph DB** | Amazon Neptune Serverless 1.4.7 (OpenCypher) |
 | **캐싱** | Amazon ElastiCache Serverless (Valkey) — Lambda 레벨 읽기 캐싱 |
 | **스토리지** | Amazon DynamoDB (AI 생성 상품) |
 | **컴퓨팅** | AWS Lambda (Python 3.11, ARM64) |
@@ -103,7 +103,7 @@ travel-md/
 │       ├── app/              #   페이지 + API Routes
 │       ├── components/       #   Cloudscape UI 컴포넌트
 │       ├── hooks/            #   커스텀 훅
-│       └── lib/              #   agentcore, gremlin, dynamodb, valkey 클라이언트
+│       └── lib/              #   agentcore, neptune, dynamodb, valkey 클라이언트
 │
 ├── scripts/                  # 유틸리티 (load_graph.py)
 ├── docs/                     # 아키텍처, 비용 추정 문서
@@ -180,13 +180,13 @@ aws cloudformation delete-stack \
 Neptune 배포 후, 크롤링 데이터를 그래프에 적재합니다:
 
 ```bash
-pip install gremlinpython boto3
+pip install boto3
 python scripts/load_graph.py \
   --data-dir ./files/crawled \
-  --endpoint wss://<NEPTUNE_ENDPOINT>:8182/gremlin
+  --endpoint <NEPTUNE_HOST>
 ```
 
-> Neptune 엔드포인트는 스택 Outputs의 `NeptuneEndpoint`에서 확인
+> Neptune 호스트명은 스택 Outputs의 `NeptuneEndpoint`에서 확인 (예: `xxx.cluster-xxx.ap-northeast-2.neptune.amazonaws.com`)
 
 ### 로컬 개발
 
@@ -253,8 +253,8 @@ make frontend                 # localhost:3000
 
 | 분류 | 도구 | 설명 |
 |------|------|------|
-| Graph 읽기 (9) | `get_package`, `search_packages`, `get_routes_by_region`, `get_attractions_by_city`, `get_hotels_by_city`, `get_trends`, `get_similar_packages`, `get_nearby_cities`, `get_cities_by_country` | Neptune Gremlin 조회 + Valkey 캐싱 |
-| Graph 쓰기 (3) | `upsert_trend`, `upsert_trend_spot`, `link_trend_to_spot` | 트렌드 데이터 적재 |
+| Graph 읽기 (9) | `get_package`, `search_packages`, `get_routes_by_region`, `get_attractions_by_city`, `get_hotels_by_city`, `get_trends`, `get_similar_packages`, `get_nearby_cities`, `get_cities_by_country` | Neptune OpenCypher 조회 + Valkey 캐싱 |
+| Graph 쓰기 (3) | `upsert_trend`, `upsert_trend_spot`, `link_trend_to_spot` | 트렌드 데이터 적재 (MERGE) |
 | DynamoDB (4) | `save_product`, `get_product`, `list_products`, `delete_product` | AI 생성 상품 CRUD |
 | 캐시 (1) | `invalidate_cache` | Valkey 캐시 무효화 |
 
@@ -274,8 +274,8 @@ make frontend                 # localhost:3000
 `.env.example` 참조:
 
 ```bash
-# Neptune
-GREMLIN_ENDPOINT=wss://<CLUSTER>.cluster-<ID>.<REGION>.neptune.amazonaws.com:8182/gremlin
+# Neptune OpenCypher
+NEPTUNE_ENDPOINT=https://<CLUSTER>.cluster-<ID>.<REGION>.neptune.amazonaws.com:8182
 
 # Valkey
 REDIS_HOST=<CACHE_NAME>.serverless.<REGION_SHORT>.cache.amazonaws.com

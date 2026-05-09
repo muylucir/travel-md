@@ -11,14 +11,14 @@ export interface PlanningInput {
   departure_season: string;
   similarity_level: number;
   reference_product_id?: string;
+  /** Theme.key (companion + interest groups) — v3 Theme vertex keys */
   themes: string[];
+  /** v3 Brand vertex name: "세이브" (쇼핑 포함) | "스탠다드" (쇼핑 미포함) */
+  brand?: string;
   natural_language_request?: string;
   target_customer?: string;
-  max_budget_per_person?: number;
-  max_shopping_count?: number;
   meal_preference?: string;
   hotel_grade?: string;
-  trend_mix?: { hot: number; steady: number };
   input_mode: "chat" | "form";
 }
 
@@ -90,12 +90,29 @@ export interface DestinationCity {
   frequency: string;
 }
 
+export interface GraphTraceQuery {
+  cypher: string;
+  params: Record<string, unknown>;
+  rows: number;
+  latency_ms: number;
+}
+
+export interface GraphTraceCall {
+  tool: string;
+  arguments: Record<string, unknown>;
+  source: "live" | "cache" | "agent_cache" | "error";
+  latency_ms: number;
+  queries: GraphTraceQuery[];
+  error?: string;
+}
+
 export interface ChangesSummary {
   retained: string[];
   modified: string[];
-  trend_added: string[];
   similarity_applied: number;
   layers_modified: string[];
+  /** Deprecated — kept optional for backward compatibility with old DDB items. */
+  trend_added?: string[];
 }
 
 export interface PlanningOutput {
@@ -122,7 +139,10 @@ export interface PlanningOutput {
 
   pricing: Pricing;
 
-  shopping_count: number;
+  /** v3 Brand vertex name: "세이브" (쇼핑 포함) | "스탠다드" (쇼핑 미포함) */
+  brand?: string;
+  /** Deprecated — replaced by `brand`. Optional for backward compat. */
+  shopping_count?: number;
   guide_fee: GuideFee;
   product_line: string;
 
@@ -151,7 +171,10 @@ export interface PlanningOutput {
   similarity_score: number;
   reference_products: string[];
   changes_summary: ChangesSummary;
-  trend_sources: string[];
+  /** Knowledge Graph 도구 호출 트레이스 */
+  graph_trace?: GraphTraceCall[];
+  /** Deprecated — kept optional for backward compatibility. */
+  trend_sources?: string[];
   generated_at: string;
   generated_by: string;
   planning_started_at?: string;
@@ -214,6 +237,8 @@ export interface PackageNode {
   deposit_per_person?: number;
   source_url?: string;
   travel_cities?: string;
+  /** v3 Brand: "세이브" (쇼핑 포함) | "스탠다드" (쇼핑 미포함) */
+  brand?: string;
 }
 
 export interface CityNode {
@@ -299,20 +324,142 @@ export interface GraphData {
   stats: Record<string, number>;
 }
 
+// v3 스키마 (15 정점) — SCHEMA_REFERENCE.md 기준
 export const NODE_TYPE_COLORS: Record<string, string> = {
-  Package: "#0972d3",
-  Attraction: "#037f0c",
-  City: "#d91515",
-  Route: "#8456ce",
-  Theme: "#e07941",
-  Region: "#067f68",
-  Airline: "#656871",
-  Hotel: "#c33d69",
+  // 마스터
   Country: "#2ea597",
+  City: "#d91515",
+  // 상품
+  Brand: "#9c5fff",
+  RepresentativeProduct: "#0972d3",
+  SaleProduct: "#1f78b4",
+  // 항공
+  Airline: "#656871",
+  Airport: "#414d5c",
+  FlightSegment: "#8456ce",
+  // 숙박
+  HotelStay: "#c33d69",
+  Hotel: "#df3312",
+  // 명소
+  Attraction: "#037f0c",
+  // 추천 신호
+  Theme: "#e07941",
   Season: "#b8860b",
-  Trend: "#e6550d",
-  TrendSpot: "#fd8d3c",
+  // 트렌드 placeholder (A6 — 추천 weight 미사용)
+  HotTrend: "#fd8d3c",
+  SteadyTrend: "#5b9bd5",
 };
+
+// v3 정점 라벨 메타데이터 (SCHEMA_REFERENCE.md §1)
+export const V3_VERTEX_INFO: Record<
+  string,
+  { count: number; description: string; idPattern: string }
+> = {
+  Country: {
+    count: 2,
+    description: "마스터 그대로",
+    idPattern: "Country:{code}",
+  },
+  City: {
+    count: 524,
+    description: "마스터 그대로 (운영 모집단은 4 도시: OSA/UKY/UKB/ARN)",
+    idPattern: "City:{code}",
+  },
+  Brand: {
+    count: 2,
+    description: "세이브(쇼핑 포함) / 스탠다드(쇼핑 미포함)",
+    idPattern: "Brand:{name}",
+  },
+  Airline: {
+    count: 12,
+    description: "package_airport.airlCd distinct",
+    idPattern: "Airline:{airlineCode}",
+  },
+  Airport: {
+    count: 39,
+    description: "package_airport_city + package_airport 조인",
+    idPattern: "Airport:{airportCode}",
+  },
+  RepresentativeProduct: {
+    count: 62,
+    description: "package_product_meta.rprsProdCd distinct",
+    idPattern: "RepresentativeProduct:{rprsProdCd}",
+  },
+  SaleProduct: {
+    count: 76,
+    description: "package_product_meta 전체",
+    idPattern: "SaleProduct:{saleProdCd}",
+  },
+  FlightSegment: {
+    count: 152,
+    description: "76 SaleProduct × 2 segments",
+    idPattern: "FlightSegment:{saleProdCd}:{segReq}",
+  },
+  HotelStay: {
+    count: 364,
+    description: "package_hotel_stay 전체",
+    idPattern: "HotelStay:{saleProdCd}:{schdDay}:{htlCd}",
+  },
+  Attraction: {
+    count: 1053,
+    description: "간사이 ∧ 비-교통 ∧ useYn=Y (A1)",
+    idPattern: "Attraction:{LJP_id}",
+  },
+  Hotel: {
+    count: 4389,
+    description: "JP ∧ 간사이 4 도시 (A2)",
+    idPattern: "Hotel:{packageHotelId}",
+  },
+  Theme: {
+    count: 10,
+    description: "themes 메타 시드 (5 companion + 5 interest)",
+    idPattern: "Theme:{key}",
+  },
+  Season: {
+    count: 4,
+    description: "seasons 메타 시드 (Q1~Q4)",
+    idPattern: "Season:{key}",
+  },
+  HotTrend: {
+    count: 1,
+    description: "default placeholder (A6) — 분류기 도입 전",
+    idPattern: "HotTrend:{period}:{slug}",
+  },
+  SteadyTrend: {
+    count: 1,
+    description: "default placeholder (A6)",
+    idPattern: "SteadyTrend:{slug}",
+  },
+};
+
+// v3 엣지 라벨 메타데이터 (SCHEMA_REFERENCE.md §2 — 20 종)
+export const V3_EDGE_INFO: ReadonlyArray<{
+  label: string;
+  count: number;
+  direction: string;
+  weighted?: boolean;
+}> = [
+  { label: "IN_COUNTRY", count: 5966, direction: "City|Hotel|Attraction → Country" },
+  { label: "IN_CITY", count: 5442, direction: "Hotel|Attraction → City" },
+  { label: "OPERATED_BY", count: 152, direction: "FlightSegment → Airline" },
+  { label: "INSTANCE_OF", count: 76, direction: "SaleProduct → RepresentativeProduct" },
+  { label: "HAS_BRAND", count: 76, direction: "SaleProduct → Brand" },
+  { label: "ARRIVES_IN", count: 76, direction: "SaleProduct → City" },
+  { label: "VISITS_CITY", count: 218, direction: "SaleProduct → City" },
+  { label: "HAS_FLIGHT_SEGMENT", count: 152, direction: "SaleProduct → FlightSegment" },
+  { label: "DEPARTS_FROM_AIRPORT", count: 152, direction: "FlightSegment → Airport" },
+  { label: "ARRIVES_AT_AIRPORT", count: 152, direction: "FlightSegment → Airport" },
+  { label: "HAS_HOTEL_STAY", count: 364, direction: "SaleProduct → HotelStay" },
+  { label: "MATCHED_TO", count: 172, direction: "HotelStay → Hotel" },
+  { label: "HAS_SCHEDULED_ATTRACTION", count: 252, direction: "SaleProduct → Attraction" },
+  { label: "IN_THEME", count: 10490, direction: "Attraction → Theme", weighted: true },
+  { label: "BEST_IN_SEASON", count: 4196, direction: "Attraction → Season", weighted: true },
+  { label: "IN_HOT_TREND", count: 1053, direction: "Attraction → HotTrend", weighted: true },
+  { label: "IN_STEADY_TREND", count: 1053, direction: "Attraction → SteadyTrend", weighted: true },
+  { label: "TRAVEL_TO", count: 47, direction: "Attraction → Attraction", weighted: true },
+  { label: "ARRIVAL_FIRST_VISIT", count: 10, direction: "Airport → Attraction", weighted: true },
+  { label: "DEPARTURE_LAST_VISIT", count: 9, direction: "Attraction → Airport", weighted: true },
+];
 
 // ─── Chat ───
 
@@ -325,59 +472,24 @@ export interface ChatMessage {
 
 // ─── Constants ───
 
+// ─── 간사이 4도시 (v3 운영 모집단: OSA / UKY / UKB / ARN) ─────────────────
+//
+// v3 그래프 데이터는 간사이 4개 도시로만 모집단이 한정됩니다. 다른 지역은
+// 추천 데이터가 없으므로 UI에서 노출하지 않습니다.
+
 export const REGIONS = [
   { value: "일본", label: "일본" },
-  { value: "동남아시아", label: "동남아시아" },
-  { value: "유럽", label: "유럽" },
-  { value: "미주", label: "미주" },
-  { value: "중국/대만/홍콩", label: "중국/대만/홍콩" },
-  { value: "대양주", label: "대양주" },
+] as const;
+
+export const KANSAI_CITIES = [
+  { value: "오사카", code: "OSA", label: "오사카 (Osaka)" },
+  { value: "교토", code: "UKY", label: "교토 (Kyoto)" },
+  { value: "고베", code: "UKB", label: "고베 (Kobe)" },
+  { value: "나라", code: "ARN", label: "나라 (Nara)" },
 ] as const;
 
 export const SUB_REGIONS: Record<string, Array<{ value: string; label: string }>> = {
-  "일본": [
-    { value: "오사카", label: "오사카 / 간사이" },
-    { value: "규슈", label: "규슈" },
-    { value: "도쿄", label: "도쿄 / 간토" },
-    { value: "홋카이도", label: "홋카이도" },
-    { value: "오키나와", label: "오키나와" },
-    { value: "나고야", label: "나고야 / 중부" },
-  ],
-  "동남아시아": [
-    { value: "다낭", label: "다낭" },
-    { value: "방콕", label: "방콕" },
-    { value: "세부", label: "세부" },
-    { value: "발리", label: "발리" },
-    { value: "하노이", label: "하노이" },
-    { value: "싱가포르", label: "싱가포르" },
-  ],
-  "유럽": [
-    { value: "파리", label: "파리" },
-    { value: "로마", label: "로마 / 이탈리아" },
-    { value: "바르셀로나", label: "바르셀로나 / 스페인" },
-    { value: "런던", label: "런던" },
-    { value: "스위스", label: "스위스" },
-    { value: "동유럽", label: "동유럽" },
-  ],
-  "미주": [
-    { value: "하와이", label: "하와이" },
-    { value: "뉴욕", label: "뉴욕" },
-    { value: "LA", label: "LA / 서부" },
-    { value: "캐나다", label: "캐나다" },
-    { value: "멕시코", label: "멕시코 / 칸쿤" },
-  ],
-  "중국/대만/홍콩": [
-    { value: "대만", label: "대만" },
-    { value: "홍콩", label: "홍콩/마카오" },
-    { value: "상하이", label: "상하이" },
-    { value: "베이징", label: "베이징" },
-  ],
-  "대양주": [
-    { value: "시드니", label: "시드니" },
-    { value: "괌", label: "괌" },
-    { value: "사이판", label: "사이판" },
-    { value: "뉴질랜드", label: "뉴질랜드" },
-  ],
+  "일본": KANSAI_CITIES.map(({ value, label }) => ({ value, label })),
 };
 
 export const SEASONS = [
@@ -387,28 +499,30 @@ export const SEASONS = [
   { value: "겨울", label: "겨울 (12~2월)" },
 ] as const;
 
-export const THEMES = [
-  { value: "가족여행", label: "가족여행" },
-  { value: "힐링", label: "힐링" },
-  { value: "온천", label: "온천" },
-  { value: "허니문", label: "허니문" },
-  { value: "식도락", label: "식도락" },
-  { value: "쇼핑", label: "쇼핑" },
-  { value: "액티비티", label: "액티비티" },
-  { value: "문화탐방", label: "문화탐방" },
-  { value: "자연/트레킹", label: "자연/트레킹" },
-  { value: "효도여행", label: "효도여행" },
-  { value: "졸업여행", label: "졸업여행" },
-  { value: "우정여행", label: "우정여행" },
-  { value: "혼행(나홀로)", label: "혼행(나홀로)" },
-  { value: "시즌이벤트", label: "시즌이벤트" },
+// ─── 테마 (v3 Theme 정점 — companion 5 + interest 5) ───────────────────────
+
+export const THEMES_COMPANION = [
+  { value: "FAMILY_WITH_KIDS", label: "가족여행" },
+  { value: "WITH_PARENTS", label: "부모님동행" },
+  { value: "ROMANTIC_COUPLE", label: "로맨틱커플" },
+  { value: "FRIENDS", label: "친구여행" },
+  { value: "SOLO_HEALING", label: "혼자힐링" },
 ] as const;
 
-export const SHOPPING_OPTIONS = [
-  { value: "-1", label: "제한없음" },
-  { value: "0", label: "0회 (쇼핑 없음)" },
-  { value: "1", label: "1회" },
-  { value: "2", label: "2회" },
+export const THEMES_INTEREST = [
+  { value: "FOODIE", label: "미식" },
+  { value: "HISTORY_CULTURE", label: "역사문화" },
+  { value: "NATURE_SCENERY", label: "자연풍경" },
+  { value: "SHOPPING", label: "쇼핑" },
+  { value: "ACTIVITY_EXPERIENCE", label: "체험액티비티" },
+] as const;
+
+// ─── 브랜드 (v3 Brand 정점 — 쇼핑 포함 여부 결정) ─────────────────────────
+// 세이브: 쇼핑 포함  /  스탠다드: 쇼핑 미포함
+
+export const BRANDS = [
+  { value: "세이브", label: "세이브 (쇼핑 포함)" },
+  { value: "스탠다드", label: "스탠다드 (쇼핑 미포함)" },
 ] as const;
 
 export const MEAL_OPTIONS = [

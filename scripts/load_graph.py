@@ -70,7 +70,7 @@ def execute_query(endpoint: str, cypher: str, params: dict | None = None) -> lis
 # 설정
 # ============================================================
 
-DEFAULT_ENDPOINT = "REDACTED_NEPTUNE_HOST"
+DEFAULT_ENDPOINT = "db-neptune-2.cluster-cje4bejv0vps.ap-northeast-2.neptune.amazonaws.com"
 
 # 해시태그 -> 테마 자동 분류
 THEME_KEYWORDS = {

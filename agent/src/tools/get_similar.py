@@ -1,4 +1,4 @@
-"""Tool: get_similar_packages -- SIMILAR_TO edge traversal."""
+"""Tool: get_similar_packages -- v3 sibling SaleProducts."""
 
 from __future__ import annotations
 
@@ -7,38 +7,45 @@ import logging
 
 from strands import tool
 
-from src.tools.graph_client import execute_query, extract_node, parse_json_field
+from src.tools.graph_client import execute_query, extract_node
 
 logger = logging.getLogger(__name__)
 
 
 @tool
-def get_similar_packages(package_code: str) -> str:
-    """Find packages that are similar to the given package via SIMILAR_TO edges.
+def get_similar_packages(saleProdCd: str) -> str:
+    """Find SaleProducts similar to the given one.
 
-    Returns a list of similar packages ordered by similarity score descending.
-    Useful for finding alternative reference packages or understanding the
-    competitive landscape.
+    v3 has no SIMILAR_TO edge; this returns sibling products under the
+    same RepresentativeProduct (INSTANCE_OF), and falls back to the same
+    arrival city when no siblings exist.
 
     Args:
-        package_code: The package code to find similar packages for, e.g. 'JKP130260401TWX'.
+        saleProdCd: The reference SaleProduct code.
     """
+    if not saleProdCd:
+        return json.dumps({"error": "saleProdCd is required"}, ensure_ascii=False)
+
     rows = execute_query(
-        "MATCH (:Package {code: $code})-[s:SIMILAR_TO]->(p2:Package) "
-        "RETURN p2, s.score AS score "
-        "ORDER BY s.score DESC LIMIT 10",
-        {"code": package_code},
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[:INSTANCE_OF]->(rp:RepresentativeProduct) "
+        "MATCH (p2:SaleProduct)-[:INSTANCE_OF]->(rp) "
+        "WHERE p2.saleProdCd <> $code "
+        "RETURN p2 LIMIT 10",
+        {"code": saleProdCd},
     )
 
-    packages = []
-    for row in rows:
-        pkg = extract_node(row, "p2")
-        for field in ("season", "hashtags", "guide_fee"):
-            if field in pkg:
-                pkg[field] = parse_json_field(pkg[field])
-        packages.append({
-            "package": pkg,
-            "similarity_score": row.get("score", 0),
-        })
+    if not rows:
+        rows = execute_query(
+            "MATCH (p:SaleProduct {saleProdCd: $code}) "
+            "MATCH (p2:SaleProduct) "
+            "WHERE p2.saleProdCd <> $code AND p2.arrCityCd = p.arrCityCd "
+            "RETURN p2 LIMIT 10",
+            {"code": saleProdCd},
+        )
 
-    return json.dumps({"similar_packages": packages, "count": len(packages)}, ensure_ascii=False, default=str)
+    similar = [{"saleProduct": extract_node(r, "p2")} for r in rows]
+    return json.dumps(
+        {"similar_packages": similar, "count": len(similar)},
+        ensure_ascii=False,
+        default=str,
+    )

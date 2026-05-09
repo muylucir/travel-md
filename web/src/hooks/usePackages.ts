@@ -1,13 +1,17 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import type { PackageNode } from "@/lib/types";
 
 export interface PackageFilters {
   destination?: string;
-  theme?: string;
-  season?: string;
+  /** v3 Theme.key (e.g. FAMILY_WITH_KIDS, FOODIE) */
+  theme_key?: string;
+  /** Season.quarter 1..4 */
+  season_quarter?: number;
   nights?: number;
+  /** v3 Brand: "세이브" | "스탠다드" */
+  brand?: string;
   limit?: number;
 }
 
@@ -18,7 +22,7 @@ export interface UsePackagesReturn {
   refresh: (filters?: PackageFilters) => Promise<void>;
 }
 
-export function usePackages(initialFilters?: PackageFilters): UsePackagesReturn {
+export function usePackages(): UsePackagesReturn {
   const [packages, setPackages] = useState<PackageNode[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,9 +36,10 @@ export function usePackages(initialFilters?: PackageFilters): UsePackagesReturn 
       const f = filters || {};
 
       if (f.destination) params.set("destination", f.destination);
-      if (f.theme) params.set("theme", f.theme);
-      if (f.season) params.set("season", f.season);
+      if (f.theme_key) params.set("theme_key", f.theme_key);
+      if (f.season_quarter) params.set("season_quarter", String(f.season_quarter));
       if (f.nights) params.set("nights", String(f.nights));
+      if (f.brand) params.set("brand", f.brand);
       if (f.limit) params.set("limit", String(f.limit));
 
       const queryString = params.toString();
@@ -58,10 +63,6 @@ export function usePackages(initialFilters?: PackageFilters): UsePackagesReturn 
       setLoading(false);
     }
   }, []);
-
-  useEffect(() => {
-    refresh(initialFilters);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return { packages, loading, error, refresh };
 }

@@ -1,4 +1,4 @@
-"""Tool: get_hotels_by_city -- City hotel lookup."""
+"""Tool: get_hotels_by_city -- v3 city hotel lookup."""
 
 from __future__ import annotations
 
@@ -13,31 +13,31 @@ logger = logging.getLogger(__name__)
 
 
 @tool
-def get_hotels_by_city(city: str, grade: str = "", has_onsen: bool = False) -> str:
-    """Retrieve hotels in a specific city, optionally filtered by grade and onsen availability.
+def get_hotels_by_city(city: str, grade: str = "") -> str:
+    """Retrieve hotels in a specific city.
 
-    Use this to find alternative hotel options when building an itinerary.
+    v3 edge direction: (Hotel)-[:IN_CITY]->(City). v3 Hotel has no
+    onsen/amenity flags — only `grade` is filterable.
 
     Args:
-        city: City name, e.g. '이마리', '오사카'.
-        grade: Optional hotel grade filter, e.g. '비즈니스', '5성급', '료칸'.
-        has_onsen: If true, only return hotels with onsen facilities.
+        city: City name or code (e.g. '오사카', 'OSA').
+        grade: Optional Hotel.grade filter.
     """
-    where_parts = []
+    where_parts = ["(c.name = $city OR c.code = $city)"]
     params: dict = {"city": city}
-
     if grade:
         where_parts.append("h.grade = $grade")
         params["grade"] = grade
-    if has_onsen:
-        where_parts.append("h.has_onsen = true")
 
-    query = "MATCH (:City {name: $city})-[:HAS_HOTEL]->(h:Hotel)"
-    if where_parts:
-        query += " WHERE " + " AND ".join(where_parts)
-    query += " RETURN h"
+    query = (
+        "MATCH (h:Hotel)-[:IN_CITY]->(c:City) "
+        "WHERE " + " AND ".join(where_parts) + " "
+        "RETURN h LIMIT 200"
+    )
 
     rows = execute_query(query, params)
     hotels = [extract_node(row, "h") for row in rows]
 
-    return json.dumps({"hotels": hotels, "count": len(hotels)}, ensure_ascii=False, default=str)
+    return json.dumps(
+        {"hotels": hotels, "count": len(hotels)}, ensure_ascii=False, default=str
+    )

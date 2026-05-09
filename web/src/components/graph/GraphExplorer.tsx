@@ -9,9 +9,6 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Select from "@cloudscape-design/components/select";
-import Modal from "@cloudscape-design/components/modal";
-import Alert from "@cloudscape-design/components/alert";
-import Input from "@cloudscape-design/components/input";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import CytoscapeGraph from "./CytoscapeGraph";
 import type { LayoutName } from "./CytoscapeGraph";
@@ -19,6 +16,7 @@ import NodeDetailPanel from "./NodeDetailPanel";
 import GraphFilterBar from "./GraphFilterBar";
 import GraphLegend from "./GraphLegend";
 import PackageSubgraph from "./PackageSubgraph";
+import SchemaOverview from "./SchemaOverview";
 import type { GraphData, GraphNode } from "@/lib/types";
 
 const LAYOUT_OPTIONS = [
@@ -39,7 +37,7 @@ interface GraphStats {
 }
 
 export default function GraphExplorer() {
-  const [activeTab, setActiveTab] = useState("full");
+  const [activeTab, setActiveTab] = useState("schema");
 
   // Stats (loaded instantly)
   const [stats, setStats] = useState<GraphStats | null>(null);
@@ -57,16 +55,6 @@ export default function GraphExplorer() {
   const [nodeLimit, setNodeLimit] = useState(DEFAULT_LIMIT);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
-
-  // Delete modal state
-  const [deleteModalVisible, setDeleteModalVisible] = useState(false);
-  const [deleteConfirmText, setDeleteConfirmText] = useState("");
-  const [deleting, setDeleting] = useState(false);
-  const [deleteResult, setDeleteResult] = useState<{
-    success: boolean;
-    nodes: number;
-    edges: number;
-  } | null>(null);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -258,42 +246,6 @@ export default function GraphExplorer() {
     [filteredData, fullData]
   );
 
-  // Delete all graph data
-  const handleDeleteAll = useCallback(async () => {
-    setDeleting(true);
-    setDeleteResult(null);
-    try {
-      const res = await fetch("/api/graph/data", {
-        method: "DELETE",
-        headers: { "X-Confirm-Delete": "DELETE_ALL_GRAPH_DATA" },
-      });
-      const data = await res.json();
-      if (data.success) {
-        setDeleteResult({
-          success: true,
-          nodes: data.deleted.nodes,
-          edges: data.deleted.edges,
-        });
-        // Clear local state
-        setFullData(null);
-        setFilteredData(null);
-        setStats({
-          nodeCountByType: {},
-          edgeCountByLabel: {},
-          totalNodes: 0,
-          totalEdges: 0,
-        });
-      } else {
-        setDeleteResult({ success: false, nodes: 0, edges: 0 });
-      }
-    } catch {
-      setDeleteResult({ success: false, nodes: 0, edges: 0 });
-    } finally {
-      setDeleting(false);
-      setDeleteConfirmText("");
-    }
-  }, []);
-
   const availableTypes = stats
     ? Object.keys(stats.nodeCountByType).sort()
     : fullData
@@ -308,19 +260,7 @@ export default function GraphExplorer() {
     <SpaceBetween size="l">
       <Header
         variant="h1"
-        description="Neptune Knowledge Graph 시각화"
-        actions={
-          <Button
-            variant="normal"
-            iconName="remove"
-            onClick={() => {
-              setDeleteModalVisible(true);
-              setDeleteResult(null);
-            }}
-          >
-            그래프 초기화
-          </Button>
-        }
+        description="v3 Knowledge Graph — 간사이 4도시 (OSA·UKY·UKB·ARN), 6,691 정점 / 30,108 엣지"
       >
         그래프 탐색기
       </Header>
@@ -361,6 +301,11 @@ export default function GraphExplorer() {
         activeTabId={activeTab}
         onChange={({ detail }) => setActiveTab(detail.activeTabId)}
         tabs={[
+          {
+            id: "schema",
+            label: "스키마 개요",
+            content: <SchemaOverview />,
+          },
           {
             id: "full",
             label: "전체 그래프",
@@ -512,86 +457,6 @@ export default function GraphExplorer() {
         ]}
       />
 
-      {/* Delete All Confirmation Modal */}
-      <Modal
-        visible={deleteModalVisible}
-        onDismiss={() => {
-          setDeleteModalVisible(false);
-          setDeleteConfirmText("");
-          setDeleteResult(null);
-        }}
-        header="그래프 전체 초기화"
-        footer={
-          deleteResult ? (
-            <Box float="right">
-              <Button
-                variant="primary"
-                onClick={() => {
-                  setDeleteModalVisible(false);
-                  setDeleteResult(null);
-                }}
-              >
-                닫기
-              </Button>
-            </Box>
-          ) : (
-            <Box float="right">
-              <SpaceBetween direction="horizontal" size="xs">
-                <Button
-                  variant="link"
-                  onClick={() => {
-                    setDeleteModalVisible(false);
-                    setDeleteConfirmText("");
-                  }}
-                >
-                  취소
-                </Button>
-                <Button
-                  variant="primary"
-                  loading={deleting}
-                  disabled={deleteConfirmText !== "삭제"}
-                  onClick={handleDeleteAll}
-                >
-                  전체 삭제
-                </Button>
-              </SpaceBetween>
-            </Box>
-          )
-        }
-      >
-        {deleteResult ? (
-          deleteResult.success ? (
-            <Alert type="success">
-              삭제 완료: 노드 {deleteResult.nodes.toLocaleString()}개, 엣지{" "}
-              {deleteResult.edges.toLocaleString()}개가 삭제되었습니다.
-            </Alert>
-          ) : (
-            <Alert type="error">삭제 중 오류가 발생했습니다.</Alert>
-          )
-        ) : (
-          <SpaceBetween size="m">
-            <Alert type="warning">
-              Neptune 그래프 DB의 <strong>모든 노드와 엣지</strong>가
-              영구적으로 삭제됩니다. 이 작업은 되돌릴 수 없습니다.
-            </Alert>
-            {stats && stats.totalNodes > 0 && (
-              <Box>
-                현재 그래프: 노드{" "}
-                <strong>{stats.totalNodes.toLocaleString()}</strong>개, 엣지{" "}
-                <strong>{stats.totalEdges.toLocaleString()}</strong>개
-              </Box>
-            )}
-            <Box>
-              확인하려면 아래에 <strong>삭제</strong>를 입력하세요:
-            </Box>
-            <Input
-              value={deleteConfirmText}
-              onChange={({ detail }) => setDeleteConfirmText(detail.value)}
-              placeholder="삭제"
-            />
-          </SpaceBetween>
-        )}
-      </Modal>
     </SpaceBetween>
   );
 }

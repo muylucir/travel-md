@@ -1144,7 +1144,7 @@ Resources:
     Properties:
       GatewayIdentifier: !GetAtt OtaGateway.GatewayIdentifier
       Name: travel-tools
-      Description: OTA Travel Tools — 17 tools (Neptune graph + DynamoDB + Valkey)
+      Description: OTA Travel Tools — v3 schema (Neptune graph + DynamoDB + Valkey)
       TargetConfiguration:
         Mcp:
           Lambda:
@@ -1152,79 +1152,66 @@ Resources:
             ToolSchema:
               InlinePayload:
                 - Name: get_package
-                  Description: Retrieve complete package information including related cities, attractions, hotels, routes, themes, and activities.
+                  Description: Retrieve complete SaleProduct information (cities, scheduled attractions, hotel stays, flight segments, brand, representative product).
                   InputSchema:
                     Type: object
                     Properties:
-                      package_code: {Type: string, Description: The unique package code.}
-                    Required: [package_code]
+                      saleProdCd: {Type: string, Description: 'The SaleProduct code (e.g. JKP130260401TWX).'}
+                    Required: [saleProdCd]
                 - Name: search_packages
-                  Description: Search for existing travel packages matching conditions.
+                  Description: Search SaleProducts by destination/nights, with optional theme_key and season_quarter filters.
                   InputSchema:
                     Type: object
                     Properties:
-                      destination: {Type: string, Description: Region or city name.}
-                      theme: {Type: string}
-                      season: {Type: string}
-                      nights: {Type: integer}
-                      max_budget: {Type: integer}
-                      shopping_max: {Type: integer}
+                      destination: {Type: string, Description: City name or code (e.g. 오사카, OSA).}
+                      nights: {Type: integer, Description: trvlNgtCnt match (0 = no filter).}
+                      theme_key: {Type: string, Description: 'Theme.key (e.g. FAMILY_WITH_KIDS).'}
+                      season_quarter: {Type: integer, Description: 'Season.quarter 1..4 (0 = no filter).'}
                     Required: [destination]
                 - Name: get_routes_by_region
-                  Description: Retrieve available flight routes for a region.
+                  Description: Retrieve distinct flight segment routes (dep -> arr airports) arriving at a city.
                   InputSchema:
                     Type: object
                     Properties:
-                      region: {Type: string, Description: Region name.}
-                    Required: [region]
+                      arrival_city: {Type: string, Description: City name or code.}
+                    Required: [arrival_city]
                 - Name: get_attractions_by_city
-                  Description: Retrieve attractions in a city, optionally filtered by category.
+                  Description: Retrieve attractions in a city (Attraction)-[:IN_CITY]->(City), optionally filtered by Attraction.type.
                   InputSchema:
                     Type: object
                     Properties:
-                      city: {Type: string, Description: City name.}
-                      category: {Type: string}
+                      city: {Type: string, Description: City name or code.}
+                      attraction_type: {Type: string, Description: 'Optional Attraction.type filter.'}
                     Required: [city]
                 - Name: get_hotels_by_city
-                  Description: Retrieve hotels in a city, optionally filtered by grade and onsen.
+                  Description: Retrieve hotels in a city (Hotel)-[:IN_CITY]->(City), optionally filtered by grade. v3 has no onsen flag.
                   InputSchema:
                     Type: object
                     Properties:
-                      city: {Type: string, Description: City name.}
+                      city: {Type: string, Description: City name or code.}
                       grade: {Type: string}
-                      has_onsen: {Type: boolean}
                     Required: [city]
-                - Name: get_trends
-                  Description: Retrieve active trends and TrendSpot locations with time-decay scoring.
-                  InputSchema:
-                    Type: object
-                    Properties:
-                      region: {Type: string, Description: Region name.}
-                      country: {Type: string, Description: Country name.}
-                      city: {Type: string, Description: City name.}
-                      min_score: {Type: integer, Description: Minimum virality score (default 30).}
-                    Required: []
                 - Name: get_similar_packages
-                  Description: Find similar packages via SIMILAR_TO edges.
+                  Description: Find sibling SaleProducts under the same RepresentativeProduct (or same arrival city as fallback).
                   InputSchema:
                     Type: object
                     Properties:
-                      package_code: {Type: string, Description: Package code.}
-                    Required: [package_code]
+                      saleProdCd: {Type: string, Description: Reference SaleProduct code.}
+                    Required: [saleProdCd]
                 - Name: get_nearby_cities
-                  Description: Find cities near a specified city within max distance.
+                  Description: Find cities within max_km of the given city using City.centerLat/Lng (no NEAR edge in v3).
                   InputSchema:
                     Type: object
                     Properties:
-                      city: {Type: string, Description: City name.}
+                      city: {Type: string, Description: City name or code.}
                       max_km: {Type: integer}
                     Required: [city]
                 - Name: get_cities_by_country
-                  Description: Get all cities for a country from the Knowledge Graph.
+                  Description: List cities for a country (matches countryCode or countryName).
                   InputSchema:
                     Type: object
                     Properties:
-                      country: {Type: string, Description: Country name.}
+                      country: {Type: string, Description: 'Country code (JP) or name (일본).'}
                     Required: [country]
                 - Name: save_product
                   Description: Save a planned product to DynamoDB.
@@ -1255,63 +1242,13 @@ Resources:
                     Properties:
                       product_code: {Type: string}
                     Required: [product_code]
-                - Name: upsert_trend
-                  Description: Upsert a Trend vertex in Neptune. Creates if not exists, updates if exists.
-                  InputSchema:
-                    Type: object
-                    Properties:
-                      title: {Type: string, Description: Trend title.}
-                      type: {Type: string, Description: 'Trend type (e.g. drama, variety, festival, food).'}
-                      source: {Type: string, Description: 'Source (e.g. youtube, naver, google_trends, news).'}
-                      date: {Type: string, Description: ISO date string.}
-                      virality_score: {Type: integer, Description: Virality score 0-100.}
-                      decay_rate: {Type: number, Description: Decay rate 0.0-1.0.}
-                      tier: {Type: string, Description: 'Trend tier (e.g. hot, warm, emerging).'}
-                      keywords:
-                        Type: array
-                        Items: {Type: string}
-                        Description: Related keywords.
-                      evidence:
-                        Type: array
-                        Items:
-                          Type: object
-                          Properties:
-                            source: {Type: string, Description: Evidence source.}
-                            title: {Type: string, Description: Evidence title.}
-                            url: {Type: string, Description: Evidence URL.}
-                            metric: {Type: string, Description: Metric info.}
-                        Description: List of evidence items supporting this trend.
-                    Required: [title, type, source, date, virality_score, decay_rate]
-                - Name: upsert_trend_spot
-                  Description: Upsert a TrendSpot vertex in Neptune.
-                  InputSchema:
-                    Type: object
-                    Properties:
-                      name: {Type: string, Description: Spot name.}
-                      description: {Type: string}
-                      category: {Type: string}
-                      lat: {Type: number}
-                      lng: {Type: number}
-                      photo_worthy: {Type: boolean}
-                    Required: [name]
-                - Name: link_trend_to_spot
-                  Description: Link a Trend to a TrendSpot with optional City connection.
-                  InputSchema:
-                    Type: object
-                    Properties:
-                      trend_title: {Type: string}
-                      trend_source: {Type: string}
-                      spot_name: {Type: string}
-                      edge_label: {Type: string, Description: FILMED_AT or FEATURES}
-                      city_name: {Type: string, Description: City to link TrendSpot via LOCATED_IN.}
-                    Required: [trend_title, trend_source, spot_name]
                 - Name: invalidate_cache
                   Description: Delete cached MCP tool results from Valkey.
                   InputSchema:
                     Type: object
                     Properties:
-                      tool_pattern: {Type: string, Description: 'Tool name to invalidate e.g. get_trends'}
-                      flush_all: {Type: boolean, Description: If true delete ALL mcp keys}
+                      tool_pattern: {Type: string, Description: 'Tool name to invalidate (e.g. get_package).'}
+                      flush_all: {Type: boolean, Description: If true delete ALL mcp keys.}
                     Required: []
       CredentialProviderConfigurations:
         - CredentialProviderType: GATEWAY_IAM_ROLE

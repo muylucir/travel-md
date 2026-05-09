@@ -6,7 +6,7 @@ import os
 # Neptune OpenCypher (HTTPS)
 NEPTUNE_ENDPOINT: str = os.getenv(
     "NEPTUNE_ENDPOINT",
-    "https://REDACTED_NEPTUNE_HOST:8182",
+    "https://db-neptune-2.cluster-cje4bejv0vps.ap-northeast-2.neptune.amazonaws.com:8182",
 )
 
 # ElastiCache / Valkey (Redis-compatible)

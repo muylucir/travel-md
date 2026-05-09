@@ -34,14 +34,13 @@ class PlanningInput(BaseModel):
         description="Free-text additional requirements from the MD.",
     )
     target_customer: str = Field(default="", description="Target customer segment, e.g. '30대 커플'")
-    max_budget_per_person: Optional[int] = Field(
+    brand: Optional[str] = Field(
         default=None,
-        description="Maximum budget per person in KRW.",
+        description="v3 Brand vertex name: '세이브' (쇼핑 포함) | '스탠다드' (쇼핑 미포함)",
     )
-    max_shopping_count: Optional[int] = Field(
-        default=None,
-        description="Maximum allowed shopping stops.",
-    )
+    # Deprecated — kept for backward compatibility with old form payloads.
+    max_budget_per_person: Optional[int] = Field(default=None, description="(deprecated)")
+    max_shopping_count: Optional[int] = Field(default=None, description="(deprecated)")
     meal_preference: Optional[str] = Field(
         default=None,
         description="Meal preference, e.g. '전식 포함', '자유식'.",
@@ -54,7 +53,6 @@ class PlanningInput(BaseModel):
         default="form",
         description="Input mode: 'chat' for natural language, 'form' for structured form.",
     )
-    trend_mix: Optional[dict] = Field(
-        default=None,
-        description="Trend tier 배합. 예: {'hot': 70, 'steady': 30}",
-    )
+    # Deprecated — trend tools are not exposed in v3. Field retained so old
+    # form payloads do not break Pydantic validation.
+    trend_mix: Optional[dict] = Field(default=None, description="(deprecated)")

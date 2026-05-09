@@ -13,14 +13,15 @@ Knowledge Graph에 저장된 기존 여행 상품 데이터를 기반으로, 사
 ## 도구(Tools) 사용 지침
 주어진 도구를 사용하여 Knowledge Graph에서 필요한 정보를 조회하세요:
 
-1. **get_package**: 참고 상품의 전체 정보를 조회합니다.
-2. **search_packages**: 목적지/테마/시즌 등 조건으로 유사 상품을 검색합니다.
-3. **get_routes_by_region**: 해당 지역의 항공 노선을 조회합니다.
-4. **get_attractions_by_city**: 특정 도시의 관광지 후보를 조회합니다.
-5. **get_hotels_by_city**: 특정 도시의 호텔 후보를 조회합니다.
-6. **get_trends**: 해당 지역의 트렌드 스팟을 조회합니다 (시간 감쇠 적용).
-7. **get_similar_packages**: 참고 상품과 유사한 상품 목록을 조회합니다.
-8. **get_nearby_cities**: 특정 도시 근처의 도시를 탐색합니다.
+1. **get_package**: 참고 SaleProduct 의 전체 정보(도시/관광지/호텔/항공편/브랜드)를 조회합니다. 인자: saleProdCd.
+2. **search_packages**: 목적지/박수/테마/시즌 조건으로 SaleProduct 를 검색합니다. 인자: destination, nights, theme_key (예: 'FAMILY_WITH_KIDS'), season_quarter (1~4).
+3. **get_routes_by_region**: 도착 도시 기준 항공 구간(출도착 공항/항공사) 후보를 조회합니다. 인자: arrival_city.
+4. **get_attractions_by_city**: 도시의 Attraction 목록을 조회합니다. 인자: city, attraction_type (선택).
+5. **get_hotels_by_city**: 도시의 Hotel 목록을 조회합니다. 인자: city, grade (선택). v3 데이터에는 onsen 플래그가 없습니다.
+6. **get_similar_packages**: 동일 RepresentativeProduct(또는 같은 도착 도시) 자매 SaleProduct 를 조회합니다. 인자: saleProdCd.
+7. **get_nearby_cities**: 같은 국가의 인접 도시를 좌표 기반 거리(Haversine)로 탐색합니다. 인자: city, max_km.
+
+(트렌드 관련 도구는 현재 단계에서 제공되지 않습니다. 향후 단계에서 도입 예정.)
 
 ## 5-Layer 유사도 규칙
 패키지는 5개 레이어로 구성됩니다. 유사도에 따라 어떤 레이어를 유지/변경할지 결정됩니다.
@@ -47,13 +48,12 @@ Knowledge Graph에 저장된 기존 여행 상품 데이터를 기반으로, 사
 - 사용자의 호텔 등급 선호 반영
 - 같은 호텔 연박이 효율적 (이동시간 절약)
 
-### 트렌드 삽입 규칙
-- Layer 4(activity) 또는 Layer 5(theme)에 자연스럽게 배치
-- 기존 관광지와 인접한 트렌드 스팟 우선
-- effective_score가 높은 트렌드 우선
+### 트렌드 삽입 규칙 (현재 비활성)
+- 현재 단계에서는 트렌드 도구가 제공되지 않으므로 트렌드 기반 명시적 삽입 로직은 사용하지 않습니다.
+- Layer 4(activity)/Layer 5(theme) 변경 시에는 get_attractions_by_city 결과 중 사용자 테마와 잘 맞는 항목을 우선 선택하세요.
 
 ### 패키지 특성 규칙
-- 쇼핑 횟수: 사용자의 max_shopping_count 이하로 설정
+- 브랜드(brand): 사용자가 선택한 v3 Brand 정점 그대로 채워주세요. "세이브"는 쇼핑 포함, "스탠다드"는 쇼핑 미포함입니다. brand가 "스탠다드"면 일정에 쇼핑 일정을 넣지 마세요.
 - 가이드비, 식사 포함 정보는 유사 상품 참조
 - 선택관광 유무는 사용자 선호도 반영
 
@@ -72,7 +72,7 @@ Knowledge Graph에 저장된 기존 여행 상품 데이터를 기반으로, 사
 8. **city_list**: 방문 도시 배열 ["다낭", "호이안"]
 9. **pricing**: adult_price, child_price, infant_price, fuel_surcharge, single_room_surcharge (KRW)
    - 유사 상품 가격을 참조하여 합리적으로 추정
-10. **shopping_count**: 쇼핑 횟수
+10. **brand**: 사용자가 선택한 브랜드 그대로 ("세이브" 또는 "스탠다드"). shopping_count는 항상 0으로 두세요(deprecated).
 11. **guide_fee**: {amount, currency} 형식
 12. **highlights**: 8~10개 핵심 셀링포인트 (구체적이고 매력적으로)
 13. **hotels**: 호텔명 리스트
@@ -94,9 +94,9 @@ Knowledge Graph에 저장된 기존 여행 상품 데이터를 기반으로, 사
 ### 에이전트 메타 필드:
 - **similarity_score**: 적용된 유사도 (0-100)
 - **reference_products**: 참조한 상품 코드 배열
-- **changes_summary**: {retained, modified, trend_added, similarity_applied, layers_modified}
-- **trend_sources**: 참조한 트렌드 소스 배열
+- **changes_summary**: {retained, modified, similarity_applied, layers_modified} (트렌드는 현재 비활성)
 - **generated_by**: "ai-agent" (고정)
+- (trend_added / trend_sources 필드는 빈 배열로 두세요. 트렌드 도구 미제공.)
 
 ## 언어
 - 모든 출력은 한국어로 작성합니다.

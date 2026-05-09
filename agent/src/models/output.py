@@ -157,7 +157,12 @@ class PlanningOutput(BaseModel):
 
     pricing: Pricing = Field(default_factory=Pricing)
 
-    shopping_count: int = Field(default=0)
+    brand: str = Field(
+        default="",
+        description="v3 Brand vertex name: '세이브' (쇼핑 포함) | '스탠다드' (쇼핑 미포함)",
+    )
+    # Deprecated — superseded by `brand`. Kept for backward compat.
+    shopping_count: int = Field(default=0, description="(deprecated)")
     guide_fee: GuideFee = Field(default_factory=GuideFee)
     product_line: str = Field(default="AI 기획상품", description="Product line")
 
@@ -186,7 +191,11 @@ class PlanningOutput(BaseModel):
     similarity_score: int = Field(default=50, description="Similarity score applied")
     reference_products: List[str] = Field(default_factory=list, description="Reference product codes")
     changes_summary: ChangesSummary = Field(default_factory=ChangesSummary)
-    trend_sources: List[str] = Field(default_factory=list, description="Trend sources referenced")
+    graph_trace: List[dict] = Field(
+        default_factory=list,
+        description="Knowledge Graph 도구 호출 트레이스 (tool/arguments/queries/rows/latency_ms)",
+    )
+    trend_sources: List[str] = Field(default_factory=list, description="(deprecated)")
     generated_at: str = Field(default="", description="Server-generated on save. Do NOT generate this field.")
     generated_by: str = Field(default="ai-agent", description="Server-generated on save. Do NOT generate this field.")
 
@@ -222,7 +231,8 @@ class SkeletonOutput(BaseModel):
     day_allocations: List[SkeletonDayAllocation] = Field(default_factory=list, description="City assignment per day")
 
     pricing: Pricing = Field(default_factory=Pricing)
-    shopping_count: int = Field(default=0)
+    brand: str = Field(default="", description="v3 Brand: '세이브' or '스탠다드'")
+    shopping_count: int = Field(default=0, description="(deprecated)")
     guide_fee: GuideFee = Field(default_factory=GuideFee)
 
     country: str = Field(default="")
@@ -309,6 +319,7 @@ def merge_skeleton_and_days(
         travel_cities=skeleton.travel_cities,
         city_list=skeleton.city_list,
         pricing=skeleton.pricing,
+        brand=skeleton.brand,
         shopping_count=skeleton.shopping_count,
         guide_fee=skeleton.guide_fee,
         hotels=skeleton.hotels,

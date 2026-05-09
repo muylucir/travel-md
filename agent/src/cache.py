@@ -67,9 +67,8 @@ _TTL_MAP: dict[str, int] = {
     "get_package": _TTL_SEMI_STATIC,
     "get_similar_packages": _TTL_SEMI_STATIC,
     # Dynamic (6h)
-    "get_trends": _TTL_DYNAMIC,
+    "search_packages": _TTL_DYNAMIC,
     # Volatile (1h)
-    "search_packages": _TTL_VOLATILE,
     "get_product": _TTL_VOLATILE,
     "list_products": _TTL_VOLATILE,
 }
@@ -77,7 +76,6 @@ _DEFAULT_TTL: int = _TTL_VOLATILE
 
 # Write tools — NEVER cache
 WRITE_TOOLS: frozenset[str] = frozenset({
-    "upsert_trend", "upsert_trend_spot", "link_trend_to_spot",
     "save_product", "delete_product",
 })
 

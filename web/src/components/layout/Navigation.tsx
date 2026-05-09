@@ -38,33 +38,8 @@ export default function Navigation() {
           items: [
             {
               type: "link",
-              text: "패키지 브라우저",
-              href: "/packages",
-            },
-            {
-              type: "link",
-              text: "트렌드 관리",
-              href: "/trends",
-            },
-            {
-              type: "link",
               text: "그래프 탐색기",
               href: "/graph",
-            },
-            {
-              type: "link",
-              text: "스키마 관리",
-              href: "/graph/schemas",
-            },
-            {
-              type: "link",
-              text: "그래프 업로드",
-              href: "/graph/upload",
-            },
-            {
-              type: "link",
-              text: "S3 → Graph 변환",
-              href: "/graph/etl",
             },
           ],
         },

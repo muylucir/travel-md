@@ -27,7 +27,11 @@ from src.models.output import (
     DayDetailOutput,
     merge_skeleton_and_days,
 )
-from src.similarity.layer_rules import format_rules_for_prompt, compute_change_rules
+from src.similarity.layer_rules import (
+    format_rules_for_prompt,
+    compute_change_rules,
+    extract_reference_data,
+)
 from src.validator.itinerary_validator import validate_itinerary, validate_skeleton
 from src.cache import get_cache
 from src.mcp_connection import get_mcp_client, prefixed
@@ -104,40 +108,6 @@ def _count_attractions(city_attractions: dict) -> dict[str, int]:
     return counts
 
 
-def _strip_evidence_urls(trends_raw) -> dict | None:
-    """Remove evidence[].url from trends data."""
-    data = _parse_mcp_text(trends_raw)
-    if not isinstance(data, dict):
-        return data
-    for trend_item in data.get("trends", []):
-        trend = trend_item.get("trend", trend_item)
-        if isinstance(trend, dict):
-            for ev in trend.get("evidence", []):
-                if isinstance(ev, dict):
-                    ev.pop("url", None)
-    return data
-
-
-def _filter_trends_by_cities(trends_raw, cities: list[str]) -> dict | None:
-    """Keep only trends whose spots are in the given cities."""
-    data = _strip_evidence_urls(trends_raw)
-    if not isinstance(data, dict):
-        return data
-    city_set = set(cities)
-    filtered = []
-    for trend_item in data.get("trends", []):
-        spots = trend_item.get("spots", [])
-        if not spots:
-            filtered.append(trend_item)
-            continue
-        for spot in spots:
-            spot_text = f"{spot.get('name', '')} {spot.get('description', '')} {spot.get('category', '')}"
-            if any(c in spot_text for c in city_set):
-                filtered.append(trend_item)
-                break
-    return {"trends": filtered, "count": len(filtered)}
-
-
 def _extract_day_attractions(rp_raw, day_num: int) -> list[dict]:
     """Extract attractions for a specific day from reference_package."""
     data = _parse_mcp_text(rp_raw)
@@ -162,121 +132,13 @@ def _build_skeleton_context(graph_context: dict) -> dict:
     }
 
 
-def _resolve_trend_mix(planning_input: dict) -> dict[str, int]:
-    """Resolve trend_mix from planning input; default hot 70 : steady 30."""
-    mix = planning_input.get("trend_mix") if isinstance(planning_input, dict) else None
-    if isinstance(mix, dict) and mix.get("hot") is not None:
-        return mix
-    return {"hot": 70, "steady": 30}
-
-
-def _infer_tier_agent(decay_rate: float) -> str:
-    """Infer trend tier from decay_rate (agent-side fallback)."""
-    if decay_rate <= 0.10:
-        return "hot"
-    if decay_rate <= 0.25:
-        return "steady"
-    return "seasonal"
-
-
-def _distribute_trends_by_tier(
-    filtered: dict | list | str | None,
-    trend_mix: dict[str, int],
-    max_total: int = 5,
-) -> dict | list | str | None:
-    """Distribute trends by tier ratio, returning the same structure.
-
-    Parses filtered (may be JSON string, dict, or list), groups by tier,
-    selects proportionally by trend_mix, and returns in original format.
-    """
-    import math
-
-    # Parse to list of trend items
-    if filtered is None:
-        return filtered
-    items: list[dict] = []
-    raw = filtered
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return filtered
-    if isinstance(raw, dict):
-        items = raw.get("trends", [])
-    elif isinstance(raw, list):
-        items = raw
-    else:
-        return filtered
-
-    if not items:
-        return filtered
-
-    # Group by tier
-    groups: dict[str, list[dict]] = {"hot": [], "steady": [], "seasonal": []}
-    for item in items:
-        trend = item.get("trend", item) if isinstance(item, dict) else item
-        decay = float(trend.get("decay_rate", 0.1)) if isinstance(trend, dict) else 0.1
-        tier = (trend.get("tier") if isinstance(trend, dict) else None) or _infer_tier_agent(decay)
-        groups.setdefault(tier, []).append(item)
-
-    # Sort each group by effective_score descending
-    for tier_items in groups.values():
-        tier_items.sort(
-            key=lambda x: float(x.get("effective_score", 0)) if isinstance(x, dict) else 0,
-            reverse=True,
-        )
-
-    # Compute allocation
-    total_pct = sum(trend_mix.get(t, 0) for t in ("hot", "steady"))
-    result: list[dict] = []
-    remaining_slots = max_total
-
-    for tier in ("hot", "steady", "seasonal"):
-        pct = trend_mix.get(tier, 0)
-        if total_pct > 0 and pct > 0:
-            n = max(1, math.floor(max_total * pct / total_pct))
-        elif tier == "seasonal":
-            n = 0  # seasonal only fills remaining
-        else:
-            n = 0
-        take = min(n, len(groups.get(tier, [])), remaining_slots)
-        result.extend(groups.get(tier, [])[:take])
-        remaining_slots -= take
-        # Remove taken from group
-        if tier in groups:
-            groups[tier] = groups[tier][take:]
-
-    # Fill remaining slots from leftovers (hot first, then steady, then seasonal)
-    if remaining_slots > 0:
-        for tier in ("hot", "steady", "seasonal"):
-            leftover = groups.get(tier, [])
-            take = min(len(leftover), remaining_slots)
-            result.extend(leftover[:take])
-            remaining_slots -= take
-            if remaining_slots <= 0:
-                break
-
-    # Return in original format
-    if isinstance(filtered, str):
-        if isinstance(json.loads(filtered), dict):
-            return json.dumps({"trends": result, "count": len(result)}, ensure_ascii=False, default=str)
-        return json.dumps(result, ensure_ascii=False, default=str)
-    if isinstance(filtered, dict):
-        return {"trends": result, "count": len(result)}
-    return result
-
-
-def _build_day_context(graph_context: dict, day_cities: list[str], day_num: int, trend_mix: dict | None = None) -> dict:
+def _build_day_context(graph_context: dict, day_cities: list[str], day_num: int) -> dict:
     """Build a filtered graph_context for a specific Day Detail."""
     ca = graph_context.get("city_attractions", {})
     ch = graph_context.get("city_hotels", {})
-    filtered_trends = _filter_trends_by_cities(graph_context.get("trends"), day_cities)
-    if trend_mix:
-        filtered_trends = _distribute_trends_by_tier(filtered_trends, trend_mix)
     return {
         "city_attractions": {c: ca[c] for c in day_cities if c in ca},
         "city_hotels": {c: ch[c] for c in day_cities if c in ch},
-        "trends": filtered_trends,
         "reference_day_attractions": _extract_day_attractions(graph_context.get("reference_package"), day_num),
     }
 
@@ -372,9 +234,9 @@ class ParseInputNode(MultiAgentBase):
 class CollectContextNode(MultiAgentBase):
     """Call multiple Graph RAG tools via MCP Gateway to gather context.
 
-    Collects: reference package, similar packages, routes, trends,
-    attractions, hotels. All calls go through AgentCore Gateway MCP
-    instead of direct Gremlin connections.
+    Collects: reference package, similar packages, routes, attractions,
+    hotels. All calls go through AgentCore Gateway MCP. Trend tools are
+    intentionally not invoked in the v3 phase.
     """
 
     def __init__(self) -> None:
@@ -402,17 +264,44 @@ class CollectContextNode(MultiAgentBase):
         city_hint = dest_parts[-1] if dest_parts else destination
 
         context_parts: dict = {}
+        graph_trace: list[dict] = []  # 도구 호출 누적
         _call_id = 0
 
         cache = get_cache()
 
+        def _extract_inner_payload(result: object) -> object:
+            """MCP 응답({content:[{text:'...'}]}) 안의 dict 를 꺼낸다."""
+            try:
+                if isinstance(result, dict) and "content" in result:
+                    inner = result["content"][0].get("text")
+                    if isinstance(inner, str):
+                        return json.loads(inner)
+                    return inner
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+            return result
+
         def _safe_call(key: str, tool_name: str, arguments: dict):
             nonlocal _call_id
             _call_id += 1
+            started = time.time()
 
             cached = cache.get(tool_name, arguments)
             if cached is not None:
                 context_parts[key] = cached
+                inner = _extract_inner_payload(cached)
+                trace_meta = (
+                    inner.get("_trace") if isinstance(inner, dict) else None
+                ) or {}
+                graph_trace.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "source": "agent_cache",
+                        "latency_ms": round((time.time() - started) * 1000, 1),
+                        "queries": trace_meta.get("queries", []),
+                    }
+                )
                 return
 
             try:
@@ -423,25 +312,52 @@ class CollectContextNode(MultiAgentBase):
                 )
                 context_parts[key] = result
                 cache.set(tool_name, arguments, result)
+                inner = _extract_inner_payload(result)
+                trace_meta = (
+                    inner.get("_trace") if isinstance(inner, dict) else None
+                ) or {}
+                graph_trace.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "source": trace_meta.get("source", "live"),
+                        "latency_ms": round((time.time() - started) * 1000, 1),
+                        "queries": trace_meta.get("queries", []),
+                    }
+                )
             except Exception as e:
                 logger.warning("MCP call failed %s/%s: %s", key, tool_name, e)
+                graph_trace.append(
+                    {
+                        "tool": tool_name,
+                        "arguments": arguments,
+                        "source": "error",
+                        "latency_ms": round((time.time() - started) * 1000, 1),
+                        "queries": [],
+                        "error": str(e),
+                    }
+                )
 
         if reference_id:
-            _safe_call("reference_package", "get_package", {"package_code": reference_id})
+            _safe_call("reference_package", "get_package", {"saleProdCd": reference_id})
 
-        theme_str = themes[0] if themes else ""
-        search_args = {"destination": region, "theme": theme_str, "season": season, "nights": nights}
-        if max_budget:
-            search_args["max_budget"] = max_budget
-        if shopping_max is not None:
-            search_args["shopping_max"] = shopping_max
+        # v3 search_packages signature: destination, nights, theme_key, season_quarter
+        # themes from planning_input are user-facing labels (e.g. '가족여행'),
+        # so we only pass through when they already look like Theme.key (uppercase).
+        season_q_map = {"봄": 2, "여름": 3, "가을": 4, "겨울": 1}
+        search_args: dict = {"destination": region}
+        if nights:
+            search_args["nights"] = nights
+        if themes and themes[0] and themes[0].isupper():
+            search_args["theme_key"] = themes[0]
+        if season in season_q_map:
+            search_args["season_quarter"] = season_q_map[season]
         _safe_call("search_results", "search_packages", search_args)
 
-        _safe_call("routes", "get_routes_by_region", {"region": region})
-        _safe_call("trends", "get_trends", {"region": region, "min_score": 30})
+        _safe_call("routes", "get_routes_by_region", {"arrival_city": region})
 
         if reference_id:
-            _safe_call("similar_packages", "get_similar_packages", {"package_code": reference_id})
+            _safe_call("similar_packages", "get_similar_packages", {"saleProdCd": reference_id})
 
         # --- Region resolution fallback ---
         # If routes came back empty, region might be a city name (e.g., "오사카")
@@ -459,8 +375,7 @@ class CollectContextNode(MultiAgentBase):
                 region_match = re.search(r'"region":\s*"([^"]+)"', info_str)
                 if region_match and region_match.group(1) != region:
                     region = region_match.group(1)
-                    _safe_call("routes", "get_routes_by_region", {"region": region})
-                    _safe_call("trends", "get_trends", {"region": region, "min_score": 30})
+                    _safe_call("routes", "get_routes_by_region", {"arrival_city": region})
 
         # --- Per-city attraction and hotel pre-fetch ---
         cities_to_query: set = set()
@@ -510,6 +425,8 @@ class CollectContextNode(MultiAgentBase):
         if city_hotels:
             context_parts["city_hotels"] = city_hotels
 
+        # graph_trace 는 graph_context 에 포함시키지 말고 별도 키로 분리
+        context_parts["__graph_trace__"] = graph_trace
         return context_parts
 
     async def invoke_async(self, task, invocation_state=None, **kwargs):
@@ -523,6 +440,10 @@ class CollectContextNode(MultiAgentBase):
         context_parts = await asyncio.to_thread(
             self._collect_context_via_mcp, planning_input
         )
+
+        # graph_trace 분리 — graph_context 에 포함시키면 LLM 프롬프트가 비대해짐
+        graph_trace = context_parts.pop("__graph_trace__", [])
+        invocation_state["graph_trace"] = graph_trace
 
         # Store context for downstream
         invocation_state["graph_context"] = context_parts
@@ -744,9 +665,16 @@ class GenerateSkeletonNode(MultiAgentBase):
 
         planning_input = invocation_state.get("planning_input_parsed", {})
         graph_context = invocation_state.get("graph_context", {})
-        rules_prompt = invocation_state.get("similarity_rules_prompt", "")
         correction_guide = invocation_state.get("skeleton_correction_guide", "")
         retry_count = invocation_state.get("skeleton_retry_count", 0)
+
+        # 유사도 규칙을 reference 의 실제 값과 함께 프롬프트로 재생성.
+        # ParseInputNode 가 만든 rules_prompt 는 reference 값을 모르므로 여기서
+        # 더 강한 버전으로 덮어쓴다.
+        similarity = int(planning_input.get("similarity_level", 50))
+        ref_raw = graph_context.get("reference_package")
+        ref_data = extract_reference_data(ref_raw) if ref_raw else {}
+        rules_prompt = format_rules_for_prompt(similarity, reference_data=ref_data)
 
         parts = [
             "## 기획 요청",
@@ -770,8 +698,24 @@ class GenerateSkeletonNode(MultiAgentBase):
         result = self._agent("\n".join(parts))
         skeleton: SkeletonOutput = result.structured_output
 
+        # ── 유사도 강제 후처리 ──────────────────────────────────────────────
+        # similarity 가 retain 으로 판정한 layer 의 값을 reference 와 일치시킨다.
+        # LLM 이 무시한 경우에도 코드 레벨에서 강제 일치시켜 입력 의도를 보장.
+        rules = compute_change_rules(similarity)
+        if ref_data:
+            if rules.get("route") == "retain":
+                if ref_data.get("cities"):
+                    skeleton.city_list = list(ref_data["cities"])
+                    skeleton.travel_cities = "-".join(ref_data["cities"])
+            if rules.get("hotel") == "retain":
+                if ref_data.get("hotels"):
+                    skeleton.hotels = list(ref_data["hotels"])
+            # attractions/activities 는 day_detail 단계에서 처리
+
         invocation_state["skeleton_output"] = skeleton.model_dump()
         invocation_state["skeleton_output_obj"] = skeleton
+        invocation_state["similarity_rules"] = rules
+        invocation_state["reference_retain_data"] = ref_data
 
         output_text = json.dumps(skeleton.model_dump(), ensure_ascii=False, default=str)
         elapsed = time.time() - start
@@ -914,8 +858,6 @@ class GenerateDayDetailsNode(MultiAgentBase):
         skeleton_data = invocation_state.get("skeleton_output")
         skeleton = SkeletonOutput(**skeleton_data) if skeleton_data else invocation_state.get("skeleton_output_obj")
         graph_context = invocation_state.get("graph_context", {})
-        planning_input = invocation_state.get("planning_input_parsed", {})
-        trend_mix = _resolve_trend_mix(planning_input)
         rules_prompt = invocation_state.get("similarity_rules_prompt", "")
         failed_days = invocation_state.get("failed_days", [])
 
@@ -987,9 +929,7 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 ", ".join(set(other_days_attractions)) if other_days_attractions else "(없음)",
                 "",
                 "## Graph 컨텍스트 (이 일차 도시 관련만)",
-                json.dumps(_build_day_context(graph_context, [c.strip() for c in day_alloc.cities.split(",") if c.strip()], day_alloc.day, trend_mix=trend_mix), ensure_ascii=False, default=str),
-                "",
-                f"## 트렌드 배합: hot {trend_mix.get('hot', 0)}% / steady {trend_mix.get('steady', 0)}%",
+                json.dumps(_build_day_context(graph_context, [c.strip() for c in day_alloc.cities.split(",") if c.strip()], day_alloc.day), ensure_ascii=False, default=str),
             ])
 
             correction = invocation_state.get(f"day_{day_alloc.day}_correction", "")
@@ -1034,7 +974,47 @@ class GenerateDayDetailsNode(MultiAgentBase):
             elif alloc.day in existing_by_day:
                 day_details.append(DayDetailOutput(**existing_by_day[alloc.day]))
 
+        # ── 유사도 강제: attraction(L3) retain 시 reference 명소 보장 ─────
+        ref_data = invocation_state.get("reference_retain_data") or {}
+        rules = invocation_state.get("similarity_rules") or {}
+        if rules.get("attraction") == "retain" and ref_data.get("attractions"):
+            ref_attrs = list(ref_data["attractions"])
+            existing_names: set[str] = set()
+            for d in day_details:
+                for n in d.attractions:
+                    existing_names.add(n)
+            missing = [n for n in ref_attrs if n not in existing_names]
+            # 누락된 reference 명소를 마지막 day 의 attractions 끝에 보강한다.
+            if missing and day_details:
+                target = day_details[-1]
+                for n in missing:
+                    if n not in target.attractions:
+                        target.attractions.append(n)
+                logger.info(
+                    "Retain L3 attraction: appended %d missing reference attractions",
+                    len(missing),
+                )
+
         final_output = merge_skeleton_and_days(skeleton, day_details)
+
+        # ── similarity_score 보정: 사용자 요청값으로 강제 동기화 ─────────
+        # LLM 이 PlanningOutput.similarity_score 를 임의로 채울 수 있으므로
+        # 사용자가 슬라이더에 입력한 similarity_level 로 덮어쓴다.
+        planning_input_dict = invocation_state.get("planning_input_parsed", {})
+        target_similarity = int(planning_input_dict.get("similarity_level", 50))
+        final_output.similarity_score = target_similarity
+        if final_output.changes_summary is not None:
+            final_output.changes_summary.similarity_applied = target_similarity
+            modified_layers = [
+                layer for layer, decision in (rules or {}).items() if decision == "modify"
+            ]
+            if modified_layers:
+                final_output.changes_summary.layers_modified = modified_layers
+
+        # ── graph_trace 주입 ────────────────────────────────────────────
+        graph_trace = invocation_state.get("graph_trace") or []
+        if graph_trace:
+            final_output.graph_trace = list(graph_trace)
 
         invocation_state["planning_output"] = final_output.model_dump()
         invocation_state["planning_output_obj"] = final_output

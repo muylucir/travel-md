@@ -1,4 +1,4 @@
-"""Tool: get_attractions_by_city -- City attractions lookup."""
+"""Tool: get_attractions_by_city -- v3 city attractions lookup."""
 
 from __future__ import annotations
 
@@ -13,24 +13,35 @@ logger = logging.getLogger(__name__)
 
 
 @tool
-def get_attractions_by_city(city: str, category: str = "") -> str:
-    """Retrieve attractions located in a specific city, optionally filtered by category.
+def get_attractions_by_city(city: str, attraction_type: str = "") -> str:
+    """Retrieve attractions in a specific city.
 
-    Use this to find alternative or additional attractions when building
-    or modifying an itinerary.
+    v3 edge direction: (Attraction)-[:IN_CITY]->(City).
 
     Args:
-        city: City name, e.g. '다케오', '오사카'.
-        category: Optional attraction category, e.g. '신사', '자연', '문화'.
+        city: City name or code (e.g. '오사카', 'OSA').
+        attraction_type: Optional Attraction.type filter (e.g. 'NATURE', 'CULTURE').
     """
-    if category:
-        query = "MATCH (:City {name: $city})-[:HAS_ATTRACTION]->(a:Attraction {category: $category}) RETURN a"
-        params = {"city": city, "category": category}
+    if attraction_type:
+        query = (
+            "MATCH (a:Attraction)-[:IN_CITY]->(c:City) "
+            "WHERE (c.name = $city OR c.code = $city) AND a.type = $t "
+            "RETURN a LIMIT 200"
+        )
+        params = {"city": city, "t": attraction_type}
     else:
-        query = "MATCH (:City {name: $city})-[:HAS_ATTRACTION]->(a:Attraction) RETURN a"
+        query = (
+            "MATCH (a:Attraction)-[:IN_CITY]->(c:City) "
+            "WHERE c.name = $city OR c.code = $city "
+            "RETURN a LIMIT 200"
+        )
         params = {"city": city}
 
     rows = execute_query(query, params)
     attractions = [extract_node(row, "a") for row in rows]
 
-    return json.dumps({"attractions": attractions, "count": len(attractions)}, ensure_ascii=False, default=str)
+    return json.dumps(
+        {"attractions": attractions, "count": len(attractions)},
+        ensure_ascii=False,
+        default=str,
+    )

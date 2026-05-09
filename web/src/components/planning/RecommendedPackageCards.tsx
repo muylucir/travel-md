@@ -54,8 +54,8 @@ export default function RecommendedPackageCards({
             key={pkg.code}
             onClick={() => onSelect(isSelected ? "" : pkg.code)}
             style={{
-              flex: "1 1 180px",
-              maxWidth: 240,
+              flex: "1 1 200px",
+              maxWidth: 260,
               border: isSelected ? "2px solid #0972d3" : "1px solid #e0e0e0",
               borderRadius: 8,
               padding: 12,
@@ -80,21 +80,23 @@ export default function RecommendedPackageCards({
             <div style={{ fontSize: 11, color: "#687078", marginBottom: 6 }}>
               {pkg.code}
             </div>
-            <div style={{ fontSize: 12, marginBottom: 2 }}>
+            <div style={{ fontSize: 12, marginBottom: 4 }}>
               <span style={{ fontWeight: 500 }}>
-                {pkg.price > 0 ? `${pkg.price.toLocaleString()}원` : "-"}
+                {pkg.nights}박{pkg.days}일
               </span>
-              {pkg.rating > 0 && (
-                <span style={{ marginLeft: 8, color: "#e89e0d" }}>
-                  ★ {pkg.rating.toFixed(1)}
-                </span>
-              )}
-            </div>
-            <div style={{ fontSize: 12, color: "#555", marginBottom: 2 }}>
-              {pkg.nights}박{pkg.days}일
-              {pkg.shopping_count !== undefined && pkg.shopping_count >= 0 && (
-                <span style={{ marginLeft: 6 }}>
-                  · 쇼핑 {pkg.shopping_count}회
+              {pkg.brand && (
+                <span
+                  style={{
+                    marginLeft: 6,
+                    padding: "1px 6px",
+                    borderRadius: 10,
+                    fontSize: 11,
+                    background:
+                      pkg.brand === "세이브" ? "#fff3cd" : "#e2e3e5",
+                    color: pkg.brand === "세이브" ? "#856404" : "#495057",
+                  }}
+                >
+                  {pkg.brand}
                 </span>
               )}
             </div>
@@ -111,6 +113,22 @@ export default function RecommendedPackageCards({
                 title={pkg.travel_cities}
               >
                 {pkg.travel_cities}
+              </div>
+            )}
+            {pkg.description && (
+              <div
+                style={{
+                  fontSize: 11,
+                  color: "#545b64",
+                  marginTop: 6,
+                  display: "-webkit-box",
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: "vertical",
+                  overflow: "hidden",
+                }}
+                title={pkg.description}
+              >
+                {pkg.description}
               </div>
             )}
           </div>

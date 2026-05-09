@@ -1,4 +1,4 @@
-"""Tool: get_package -- Retrieve full package information and related entities."""
+"""Tool: get_package -- v3 SaleProduct + related entities."""
 
 from __future__ import annotations
 
@@ -7,109 +7,117 @@ import logging
 
 from strands import tool
 
-from src.tools.graph_client import execute_query, extract_node, parse_json_field
+from src.tools.graph_client import execute_query, extract_node
 
 logger = logging.getLogger(__name__)
 
 
 @tool
-def get_package(package_code: str) -> str:
-    """Retrieve complete package information including related cities, attractions, hotels, routes, themes, and activities.
-
-    Use this tool when you need to inspect a specific existing package to use as a
-    reference for generating a new itinerary.
+def get_package(saleProdCd: str) -> str:
+    """Retrieve full SaleProduct info: arrival/visit cities, scheduled attractions,
+    hotel stays (with matched Hotel master), flight segments, brand,
+    and representative product.
 
     Args:
-        package_code: The unique package code, e.g. 'JKP130260401TWX'.
+        saleProdCd: The SaleProduct code (e.g. 'JKP130260401TWX').
     """
-    params = {"code": package_code}
+    if not saleProdCd:
+        return json.dumps({"error": "saleProdCd is required"}, ensure_ascii=False)
 
-    # --- Package node ---
+    params = {"code": saleProdCd}
+
     pkg_rows = execute_query(
-        "MATCH (p:Package {code: $code}) RETURN p",
-        params,
+        "MATCH (p:SaleProduct {saleProdCd: $code}) RETURN p", params
     )
     if not pkg_rows:
-        return json.dumps({"error": f"Package '{package_code}' not found"}, ensure_ascii=False)
-
+        return json.dumps({"error": f"SaleProduct '{saleProdCd}' not found"}, ensure_ascii=False)
     package = extract_node(pkg_rows[0], "p")
-    for field in ("season", "hashtags", "guide_fee"):
-        if field in package:
-            package[field] = parse_json_field(package[field])
 
-    # --- Visited cities ---
     city_rows = execute_query(
-        "MATCH (p:Package {code: $code})-[v:VISITS]->(c:City) "
-        "RETURN c, v.day AS day, v.`order` AS order",
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[v:VISITS_CITY]->(c:City) "
+        "RETURN c, v.source AS source",
         params,
     )
-    city_list = []
+    visit_cities = []
     for row in city_rows:
-        city_data = extract_node(row, "c")
-        city_data["day"] = row.get("day")
-        city_data["order"] = row.get("order")
-        city_list.append(city_data)
+        cd = extract_node(row, "c")
+        cd["source"] = row.get("source")
+        visit_cities.append(cd)
 
-    # --- Included attractions ---
+    arr_rows = execute_query(
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[:ARRIVES_IN]->(c:City) RETURN c",
+        params,
+    )
+    arrival_city = extract_node(arr_rows[0], "c") if arr_rows else None
+
     attr_rows = execute_query(
-        "MATCH (p:Package {code: $code})-[i:INCLUDES]->(a:Attraction) "
-        "RETURN a, i.day AS day, i.`order` AS order, i.layer AS layer",
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[r:HAS_SCHEDULED_ATTRACTION]->(a:Attraction) "
+        "RETURN a, r.schdDay AS schdDay, r.schtExprSqc AS schtExprSqc "
+        "ORDER BY r.schdDay, r.schtExprSqc",
         params,
     )
-    attraction_list = []
+    attractions = []
     for row in attr_rows:
-        attr_data = extract_node(row, "a")
-        attr_data["day"] = row.get("day")
-        attr_data["order"] = row.get("order")
-        attr_data["layer"] = row.get("layer")
-        attraction_list.append(attr_data)
+        ad = extract_node(row, "a")
+        ad["schdDay"] = row.get("schdDay")
+        ad["schtExprSqc"] = row.get("schtExprSqc")
+        attractions.append(ad)
 
-    # --- Hotels ---
-    hotel_rows = execute_query(
-        "MATCH (p:Package {code: $code})-[:INCLUDES_HOTEL]->(h:Hotel) RETURN h",
+    stay_rows = execute_query(
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[hs:HAS_HOTEL_STAY]->(s:HotelStay) "
+        "OPTIONAL MATCH (s)-[:MATCHED_TO]->(h:Hotel) "
+        "RETURN s, h, hs.schdDay AS schdDay "
+        "ORDER BY hs.schdDay",
         params,
     )
-    hotel_list = [extract_node(row, "h") for row in hotel_rows]
+    hotel_stays = []
+    for row in stay_rows:
+        stay = extract_node(row, "s")
+        hotel = row.get("h")
+        if isinstance(hotel, dict) and hotel.get("~properties"):
+            stay["hotel"] = extract_node(row, "h")
+        else:
+            stay["hotel"] = None
+        stay["schdDay"] = row.get("schdDay")
+        hotel_stays.append(stay)
 
-    # --- Routes (flights) ---
-    route_rows = execute_query(
-        "MATCH (p:Package {code: $code})-[d:DEPARTS_ON]->(r:Route) "
-        "RETURN r, d.type AS flight_type",
+    seg_rows = execute_query(
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[:HAS_FLIGHT_SEGMENT]->(f:FlightSegment) "
+        "OPTIONAL MATCH (f)-[:DEPARTS_FROM_AIRPORT]->(da:Airport) "
+        "OPTIONAL MATCH (f)-[:ARRIVES_AT_AIRPORT]->(aa:Airport) "
+        "RETURN f, da, aa "
+        "ORDER BY f.segReq",
         params,
     )
-    route_list = []
-    for row in route_rows:
-        route_data = extract_node(row, "r")
-        route_data["flight_type"] = row.get("flight_type")
-        route_list.append(route_data)
+    segments = []
+    for row in seg_rows:
+        seg = extract_node(row, "f")
+        if isinstance(row.get("da"), dict) and row["da"].get("~properties"):
+            seg["depAirport"] = extract_node(row, "da")
+        if isinstance(row.get("aa"), dict) and row["aa"].get("~properties"):
+            seg["arrAirport"] = extract_node(row, "aa")
+        segments.append(seg)
 
-    # --- Themes ---
-    theme_rows = execute_query(
-        "MATCH (p:Package {code: $code})-[:TAGGED]->(t:Theme) RETURN t",
+    brand_rows = execute_query(
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[:HAS_BRAND]->(b:Brand) RETURN b",
         params,
     )
-    theme_list = [extract_node(row, "t") for row in theme_rows]
+    brand = extract_node(brand_rows[0], "b") if brand_rows else None
 
-    # --- Activities ---
-    act_rows = execute_query(
-        "MATCH (p:Package {code: $code})-[ha:HAS_ACTIVITY]->(a) "
-        "RETURN a, ha.day AS day",
+    rp_rows = execute_query(
+        "MATCH (p:SaleProduct {saleProdCd: $code})-[:INSTANCE_OF]->(rp:RepresentativeProduct) RETURN rp",
         params,
     )
-    activity_list = []
-    for row in act_rows:
-        act_data = extract_node(row, "a")
-        act_data["day"] = row.get("day")
-        activity_list.append(act_data)
+    representative = extract_node(rp_rows[0], "rp") if rp_rows else None
 
     result = {
-        "package": package,
-        "cities": city_list,
-        "attractions": attraction_list,
-        "hotels": hotel_list,
-        "routes": route_list,
-        "themes": theme_list,
-        "activities": activity_list,
+        "saleProduct": package,
+        "arrivalCity": arrival_city,
+        "visitCities": visit_cities,
+        "attractions": attractions,
+        "hotelStays": hotel_stays,
+        "flightSegments": segments,
+        "brand": brand,
+        "representative": representative,
     }
-
     return json.dumps(result, ensure_ascii=False, default=str)

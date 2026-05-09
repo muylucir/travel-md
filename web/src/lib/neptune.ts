@@ -11,7 +11,7 @@ import {
 } from "@aws-sdk/client-neptunedata";
 
 const NEPTUNE_HOST =
-  process.env.NEPTUNE_HOST || "REDACTED_NEPTUNE_HOST";
+  process.env.NEPTUNE_HOST || "db-neptune-2.cluster-cje4bejv0vps.ap-northeast-2.neptune.amazonaws.com";
 const NEPTUNE_PORT = process.env.NEPTUNE_PORT || "8182";
 const NEPTUNE_REGION = process.env.AWS_REGION || "ap-northeast-2";
 

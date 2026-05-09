@@ -26,13 +26,9 @@ from tools.graph_tools import (
     get_routes_by_region,
     get_attractions_by_city,
     get_hotels_by_city,
-    get_trends,
     get_similar_packages,
     get_nearby_cities,
     get_cities_by_country,
-    upsert_trend,
-    upsert_trend_spot,
-    link_trend_to_spot,
     invalidate_cache,
 )
 from tools.dynamodb_tools import (
@@ -46,20 +42,15 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 TOOL_REGISTRY = {
-    # Graph tools (9)
+    # Graph read tools (8)
     "get_package": get_package,
     "search_packages": search_packages,
     "get_routes_by_region": get_routes_by_region,
     "get_attractions_by_city": get_attractions_by_city,
     "get_hotels_by_city": get_hotels_by_city,
-    "get_trends": get_trends,
     "get_similar_packages": get_similar_packages,
     "get_nearby_cities": get_nearby_cities,
     "get_cities_by_country": get_cities_by_country,
-    # Graph write tools (3)
-    "upsert_trend": upsert_trend,
-    "upsert_trend_spot": upsert_trend_spot,
-    "link_trend_to_spot": link_trend_to_spot,
     # Cache management (1)
     "invalidate_cache": invalidate_cache,
     # DynamoDB tools (4)
