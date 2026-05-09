@@ -80,6 +80,12 @@ def validate_itinerary(output: PlanningOutput) -> ValidationResult:
     issues.extend(_validate_hotel_next_day_proximity(output))
     issues.extend(_validate_itinerary_continuity(output))
 
+    # Graph-grounded checks (Cypher-based)
+    try:
+        issues.extend(_validate_city_scope(output))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("city_scope validation skipped: %s", e)
+
     # Score calculation
     error_count = sum(1 for i in issues if i.severity == Severity.ERROR)
     warning_count = sum(1 for i in issues if i.severity == Severity.WARNING)
@@ -97,6 +103,86 @@ def validate_itinerary(output: PlanningOutput) -> ValidationResult:
         issues=issues,
         correction_guide=correction_guide,
     )
+
+
+def _validate_city_scope(output: PlanningOutput) -> list[Issue]:
+    """Cypher 기반 검증: 각 day 의 attractions 가 그 day 의 cities 에 속하는지.
+
+    Day 4 cities="오사카" 인데 도다이지(나라) 들어가는 케이스를 차단.
+    """
+    from src.tools.graph_client import execute_query
+
+    # 모든 day 명소 이름 수집
+    all_names: set[str] = set()
+    day_to_names: dict[int, list[str]] = {}
+    day_to_cities: dict[int, set[str]] = {}
+    for day in output.itinerary:
+        names = list(day.attractions or [])
+        if not names:
+            continue
+        day_to_names[day.day] = names
+        all_names.update(names)
+        cities = {c.strip() for c in (day.cities or "").split(",") if c.strip()}
+        day_to_cities[day.day] = cities
+
+    if not all_names:
+        return []
+
+    # Cypher 한 번에 (a.name, c.name) 조회. v3 그래프 모집단 한계로 일부 명소는
+    # 매칭 안될 수 있음(간사이 외 도시) — 매칭 안된 건 검증 스킵.
+    rows = execute_query(
+        "MATCH (a:Attraction)-[:IN_CITY]->(c:City) "
+        "WHERE a.name IN $names "
+        "RETURN a.name AS name, collect(DISTINCT c.name) AS cities",
+        {"names": sorted(all_names)},
+    )
+    name_to_cities: dict[str, set[str]] = {}
+    for r in rows:
+        name = r.get("name")
+        cs = {c for c in (r.get("cities") or []) if c}
+        if name:
+            name_to_cities[name] = cs
+
+    issues: list[Issue] = []
+    for day_num, names in day_to_names.items():
+        day_cities = day_to_cities.get(day_num, set())
+        if not day_cities:
+            continue
+        for name in names:
+            actual_cities = name_to_cities.get(name)
+            if actual_cities is None:
+                # 그래프에 없는 명소 — LLM 환각일 가능성
+                issues.append(
+                    Issue(
+                        severity=Severity.ERROR,
+                        day=day_num,
+                        message=f"Day {day_num} 명소 '{name}' 가 Knowledge Graph 에 존재하지 않습니다.",
+                        suggestion=(
+                            f"recommend_attractions(city={list(day_cities)[0]}) 결과의 "
+                            "attractions[].name 중에서만 선택하세요."
+                        ),
+                    )
+                )
+                continue
+            if not (actual_cities & day_cities):
+                # 그래프에는 있지만 day 의 cities 에 속하지 않음
+                actual_str = ", ".join(sorted(actual_cities))
+                day_str = ", ".join(sorted(day_cities))
+                issues.append(
+                    Issue(
+                        severity=Severity.ERROR,
+                        day=day_num,
+                        message=(
+                            f"Day {day_num} 명소 '{name}' 의 도시는 [{actual_str}] 인데, "
+                            f"이 day 의 cities=[{day_str}] 와 일치하지 않습니다."
+                        ),
+                        suggestion=(
+                            f"이 day 의 cities ({day_str}) 안의 명소만 선택하세요. "
+                            "다른 도시 명소는 다른 day 로 옮기거나 제거하세요."
+                        ),
+                    )
+                )
+    return issues
 
 
 def _validate_time_budget(day: DayItinerary) -> list[Issue]:

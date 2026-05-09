@@ -66,3 +66,9 @@ def parse_json_field(value: Any) -> Any:
         except (json.JSONDecodeError, TypeError):
             return value
     return value
+
+
+def close_connection() -> None:
+    """Compatibility stub for local_server. boto3 client is reused; nothing to close."""
+    global _client
+    _client = None

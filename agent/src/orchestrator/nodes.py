@@ -69,77 +69,189 @@ def _parse_mcp_text(raw) -> dict | list | None:
     return data
 
 
-def _summarize_reference(rp_raw) -> dict | None:
-    """Keep only package/cities/routes/hotels from reference_package."""
-    data = _parse_mcp_text(rp_raw)
+def _summarize_bundle(bundle_raw) -> dict | None:
+    """Compress plan_context_bundle for Skeleton prompt.
+
+    Keeps reference summary, top-5 similar candidates, top-10 routes,
+    top-5 popular hotels.
+    """
+    data = _parse_mcp_text(bundle_raw)
     if not isinstance(data, dict):
         return data
-    return {k: v for k, v in data.items() if k in ("package", "cities", "routes", "hotels")}
+    out: dict = {}
+
+    # Reference: summarize visit cities + scheduled attractions per day
+    ref = data.get("reference") or {}
+    if isinstance(ref, dict):
+        sale = ref.get("saleProduct") or {}
+        cities = []
+        if ref.get("arrivalCity"):
+            arr = ref["arrivalCity"]
+            if isinstance(arr, dict) and arr.get("name"):
+                cities.append(arr["name"])
+        for c in ref.get("visitCities", []) or []:
+            if isinstance(c, dict) and c.get("name") and c["name"] not in cities:
+                cities.append(c["name"])
+        # Scheduled attractions grouped by day
+        sched = ref.get("scheduledAttractions") or []
+        by_day: dict[int, list[str]] = {}
+        for a in sched:
+            if not isinstance(a, dict):
+                continue
+            day = a.get("schdDay")
+            if day is None:
+                continue
+            by_day.setdefault(int(day), []).append(a.get("name", ""))
+        # Hotels per day
+        hotels = []
+        for s in ref.get("hotelStays") or []:
+            if not isinstance(s, dict):
+                continue
+            h = s.get("hotel") or {}
+            name = h.get("name") if isinstance(h, dict) else None
+            hotels.append({"day": s.get("schdDay"), "hotel": name or s.get("locaDesc")})
+        out["reference"] = {
+            "saleProdCd": sale.get("saleProdCd"),
+            "name": sale.get("saleProdNm"),
+            "brand": sale.get("brndNm"),
+            "nights": sale.get("trvlNgtCnt"),
+            "days": sale.get("trvlDayCnt"),
+            "cities": cities,
+            "attractions_by_day": by_day,
+            "hotels": hotels,
+        }
+
+    # Similar candidates — top 5
+    sim = data.get("similar") or {}
+    if isinstance(sim, dict):
+        cands = sim.get("candidates") or []
+        out["similar"] = {
+            "weights": sim.get("weights"),
+            "candidates": [
+                {
+                    "saleProdCd": (c.get("saleProduct") or {}).get("saleProdCd"),
+                    "name": (c.get("saleProduct") or {}).get("saleProdNm"),
+                    "brand": (c.get("saleProduct") or {}).get("brndNm"),
+                    "score": c.get("score"),
+                    "breakdown": c.get("breakdown"),
+                }
+                for c in cands[:5]
+                if isinstance(c, dict)
+            ],
+        }
+
+    # Route — top 10 + top 5 hotels
+    route = data.get("route") or {}
+    if isinstance(route, dict):
+        out["route"] = {
+            "arrival_city": route.get("arrival_city"),
+            "nights": route.get("nights"),
+            "routes": (route.get("routes") or [])[:10],
+            "popular_hotels": (route.get("popular_hotels") or [])[:5],
+        }
+
+    return out
 
 
-def _summarize_similar(sp_raw) -> list[dict] | None:
-    """Extract code/name/price/nights/rating from each similar package."""
-    data = _parse_mcp_text(sp_raw)
+def _summarize_recommended_attractions(raw) -> dict | None:
+    """Compress recommended_attractions response for prompts (drop heavy fields)."""
+    data = _parse_mcp_text(raw)
     if not isinstance(data, dict):
         return data
-    packages = data.get("packages", data.get("similar_packages", []))
-    if not isinstance(packages, list):
-        return data
-    summary = []
-    for item in packages:
-        pkg = item.get("package", item) if isinstance(item, dict) else item
-        if not isinstance(pkg, dict):
+    items = []
+    for a in data.get("attractions") or []:
+        if not isinstance(a, dict):
             continue
-        summary.append({k: pkg[k] for k in ("code", "name", "price", "nights", "days", "rating", "region") if k in pkg})
-    return {"packages": summary, "count": len(summary)}
-
-
-def _count_attractions(city_attractions: dict) -> dict[str, int]:
-    """Summarize city_attractions to {city: count} for Skeleton."""
-    counts = {}
-    for city, raw in city_attractions.items():
-        data = _parse_mcp_text(raw)
-        if isinstance(data, dict):
-            counts[city] = data.get("count", len(data.get("attractions", [])))
-        elif isinstance(data, list):
-            counts[city] = len(data)
-        else:
-            counts[city] = str(raw).count('"name"')
-    return counts
-
-
-def _extract_day_attractions(rp_raw, day_num: int) -> list[dict]:
-    """Extract attractions for a specific day from reference_package."""
-    data = _parse_mcp_text(rp_raw)
-    if not isinstance(data, dict):
-        return []
-    return [
-        {"name": a.get("name"), "category": a.get("category")}
-        for a in data.get("attractions", [])
-        if isinstance(a, dict) and a.get("day") == day_num
-    ]
+        items.append(
+            {
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "summary": a.get("summary"),
+                "type": a.get("type"),
+                "stay_minutes": a.get("stay_minutes"),
+                "score": a.get("score"),
+                "breakdown": a.get("breakdown"),
+                "rationale": a.get("rationale"),
+                "flags": a.get("flags"),
+            }
+        )
+    return {
+        "city": data.get("city"),
+        "weights": data.get("weights"),
+        "mood_keywords": data.get("mood_keywords"),
+        "attractions": items,
+        "count": len(items),
+    }
 
 
 def _build_skeleton_context(graph_context: dict) -> dict:
     """Build a reduced graph_context for Skeleton."""
+    rec_attr = graph_context.get("recommended_attractions", {}) or {}
+    rec_summary = {
+        c: _summarize_recommended_attractions(v) for c, v in rec_attr.items()
+    }
     return {
-        "routes": graph_context.get("routes"),
-        "city_hotels": graph_context.get("city_hotels"),
-        "reference_package": _summarize_reference(graph_context.get("reference_package")),
-        "similar_packages": _summarize_similar(graph_context.get("similar_packages")),
-        "search_results": graph_context.get("search_results"),
-        "city_attraction_counts": _count_attractions(graph_context.get("city_attractions", {})),
+        "plan_context": _summarize_bundle(graph_context.get("plan_context")),
+        "recommended_attractions": rec_summary,
     }
 
 
 def _build_day_context(graph_context: dict, day_cities: list[str], day_num: int) -> dict:
-    """Build a filtered graph_context for a specific Day Detail."""
-    ca = graph_context.get("city_attractions", {})
-    ch = graph_context.get("city_hotels", {})
+    """Build a filtered graph_context for a specific Day Detail.
+
+    Strict city scoping: only attractions whose IN_CITY matches one of
+    day_cities are exposed. The set of allowed attraction names is also
+    surfaced so the LLM can reject hallucinated names.
+    """
+    rec_attr = graph_context.get("recommended_attractions", {}) or {}
+    bundle = _parse_mcp_text(graph_context.get("plan_context")) or {}
+    ref = bundle.get("reference") if isinstance(bundle, dict) else None
+
+    # Reference day attractions, scoped to day_cities only
+    ref_day_attrs: list[dict] = []
+    if isinstance(ref, dict):
+        ref_cities_for_day = set(day_cities)
+        for a in ref.get("scheduledAttractions") or []:
+            if not isinstance(a, dict):
+                continue
+            if a.get("schdDay") != day_num:
+                continue
+            # If the reference attraction has cityName, enforce city match
+            ac = a.get("cityName") or a.get("city")
+            if ac and ac not in ref_cities_for_day:
+                continue
+            ref_day_attrs.append(
+                {"id": a.get("id"), "name": a.get("name"), "type": a.get("type")}
+            )
+
+    # Filter recommended attractions to day_cities only
+    day_rec = {
+        c: _summarize_recommended_attractions(rec_attr[c])
+        for c in day_cities
+        if c in rec_attr
+    }
+
+    # Build explicit allow-list of attraction names so the LLM cannot pick
+    # anything outside the day cities' graph candidates.
+    allowed_names: set[str] = set()
+    for v in day_rec.values():
+        if isinstance(v, dict):
+            for a in v.get("attractions") or []:
+                if isinstance(a, dict) and a.get("name"):
+                    allowed_names.add(a["name"])
+    for a in ref_day_attrs:
+        if a.get("name"):
+            allowed_names.add(a["name"])
+
     return {
-        "city_attractions": {c: ca[c] for c in day_cities if c in ca},
-        "city_hotels": {c: ch[c] for c in day_cities if c in ch},
-        "reference_day_attractions": _extract_day_attractions(graph_context.get("reference_package"), day_num),
+        "day_cities": day_cities,
+        "recommended_attractions": day_rec,
+        "reference_day_attractions": ref_day_attrs,
+        "allowed_attraction_names": sorted(allowed_names),
+        "_strict_rule": (
+            "이 day 의 cities 가 아닌 도시의 명소를 절대 사용하지 마세요. "
+            "allowed_attraction_names 에 없는 이름을 만들어내면 검증에서 차단됩니다."
+        ),
     }
 
 
@@ -246,31 +358,40 @@ class CollectContextNode(MultiAgentBase):
     def _collect_context_via_mcp(planning_input: dict) -> dict:
         """Call graph tools via MCP Gateway synchronously.
 
-        The MCP client is auto-started by get_mcp_client(), so no context
-        manager is needed.  call_tool_sync signature:
-            call_tool_sync(tool_use_id, name, arguments)
+        Score-first redesign:
+        - 1 call to plan_context_bundle (reference + similar + route)
+        - 1 call to recommend_attractions per relevant city (theme/season aware)
         """
         mcp = get_mcp_client()
 
         destination = planning_input.get("destination", "")
         season = planning_input.get("departure_season", "")
         nights = planning_input.get("duration", {}).get("nights", 0)
-        themes = planning_input.get("themes", [])
-        max_budget = planning_input.get("max_budget_per_person")
-        shopping_max = planning_input.get("max_shopping_count")
-        reference_id = planning_input.get("reference_product_id")
-        dest_parts = destination.split() if destination else []
-        region = dest_parts[-1] if dest_parts else destination
-        city_hint = dest_parts[-1] if dest_parts else destination
+        themes = planning_input.get("themes", []) or []
+        brand = planning_input.get("brand", "") or ""
+        reference_id = planning_input.get("reference_product_id") or ""
+        free_text = planning_input.get("natural_language_request", "") or ""
+
+        # destination 은 폼에서 단일 도시 (간사이 4도시 중 하나)로 들어옴
+        arrival_city = destination.split()[-1] if destination else destination
+
+        # 시즌 매핑 (한국어 → 분기)
+        season_q_map = {"봄": 2, "여름": 3, "가을": 4, "겨울": 1}
+        season_quarter = season_q_map.get(season, 0)
+
+        # themes 에서 첫 companion / interest 키 추출 (영문 키만 받는다)
+        primary_theme_key = ""
+        for t in themes:
+            if isinstance(t, str) and t.isupper():
+                primary_theme_key = t
+                break
 
         context_parts: dict = {}
-        graph_trace: list[dict] = []  # 도구 호출 누적
+        graph_trace: list[dict] = []
         _call_id = 0
-
         cache = get_cache()
 
         def _extract_inner_payload(result: object) -> object:
-            """MCP 응답({content:[{text:'...'}]}) 안의 dict 를 꺼낸다."""
             try:
                 if isinstance(result, dict) and "content" in result:
                     inner = result["content"][0].get("text")
@@ -338,95 +459,75 @@ class CollectContextNode(MultiAgentBase):
                     }
                 )
 
-        if reference_id:
-            _safe_call("reference_package", "get_package", {"saleProdCd": reference_id})
-
-        # v3 search_packages signature: destination, nights, theme_key, season_quarter
-        # themes from planning_input are user-facing labels (e.g. '가족여행'),
-        # so we only pass through when they already look like Theme.key (uppercase).
-        season_q_map = {"봄": 2, "여름": 3, "가을": 4, "겨울": 1}
-        search_args: dict = {"destination": region}
+        # 1. Skeleton 컨텍스트 — 1회 호출로 reference + similar + route 일괄
+        bundle_args: dict = {"arrival_city": arrival_city}
         if nights:
-            search_args["nights"] = nights
-        if themes and themes[0] and themes[0].isupper():
-            search_args["theme_key"] = themes[0]
-        if season in season_q_map:
-            search_args["season_quarter"] = season_q_map[season]
-        _safe_call("search_results", "search_packages", search_args)
-
-        _safe_call("routes", "get_routes_by_region", {"arrival_city": region})
-
+            bundle_args["nights"] = nights
         if reference_id:
-            _safe_call("similar_packages", "get_similar_packages", {"saleProdCd": reference_id})
+            bundle_args["saleProdCd"] = reference_id
+        if primary_theme_key:
+            bundle_args["theme_key"] = primary_theme_key
+        if season_quarter:
+            bundle_args["season_quarter"] = season_quarter
+        if brand:
+            bundle_args["brand"] = brand
+        _safe_call("plan_context", "plan_context_bundle", bundle_args)
 
-        # --- Region resolution fallback ---
-        # If routes came back empty, region might be a city name (e.g., "오사카")
-        # Try to resolve the actual region via get_nearby_cities
-        routes_result = context_parts.get("routes")
-        routes_empty = not routes_result or (
-            isinstance(routes_result, str) and '"count": 0' in routes_result
-        )
-        if routes_empty and city_hint:
-            _safe_call("_city_info", "get_nearby_cities", {"city": city_hint, "max_km": 0})
-            city_info = context_parts.pop("_city_info", None)
-            if city_info:
-                # Parse region from nearby_cities response
-                info_str = str(city_info)
-                region_match = re.search(r'"region":\s*"([^"]+)"', info_str)
-                if region_match and region_match.group(1) != region:
-                    region = region_match.group(1)
-                    _safe_call("routes", "get_routes_by_region", {"arrival_city": region})
+        # 2. 어떤 도시들을 day detail 단계에서 다룰지 결정
+        #    (1) 사용자 destination
+        #    (2) reference 의 visit cities (있으면)
+        cities_to_query: list[str] = []
+        if arrival_city:
+            cities_to_query.append(arrival_city)
 
-        # --- Per-city attraction and hotel pre-fetch ---
-        cities_to_query: set = set()
+        plan_inner = _extract_inner_payload(context_parts.get("plan_context"))
+        if isinstance(plan_inner, dict):
+            ref = plan_inner.get("reference") or {}
+            if isinstance(ref, dict):
+                for c in ref.get("visitCities", []) or []:
+                    if isinstance(c, dict) and c.get("name"):
+                        nm = c["name"]
+                        if nm and nm not in cities_to_query:
+                            cities_to_query.append(nm)
+                arr = ref.get("arrivalCity") or {}
+                if (
+                    isinstance(arr, dict)
+                    and arr.get("name")
+                    and arr["name"] not in cities_to_query
+                ):
+                    cities_to_query.append(arr["name"])
 
-        # Extract cities from search results
-        sr = context_parts.get("search_results")
-        if sr:
-            sr_str = str(sr)
-            for field in ("city_list", "travel_cities"):
-                for m in re.finditer(rf'"{field}":\s*\[([^\]]*)\]', sr_str):
-                    for city_m in re.finditer(r'"([^"]+)"', m.group(1)):
-                        cities_to_query.add(city_m.group(1))
-
-        # Extract cities from reference package (parse JSON, not regex)
-        rp = context_parts.get("reference_package")
-        if rp:
-            rp_data = _parse_mcp_text(rp)
-            if isinstance(rp_data, dict):
-                for city in rp_data.get("cities", []):
-                    if isinstance(city, dict) and "name" in city:
-                        cities_to_query.add(city["name"])
-
-        if city_hint:
-            cities_to_query.add(city_hint)
-
-        # Remove departure cities
+        # 출발 도시는 제외
         DEPARTURE = {"인천", "김포", "부산", "대구", "제주", "청주", "무안", "양양"}
-        cities_to_query -= DEPARTURE
+        cities_to_query = [c for c in cities_to_query if c not in DEPARTURE]
+        cities_to_query = cities_to_query[:5]
 
-        # Fetch attractions and hotels for top 5 cities
-        city_attractions: dict = {}
-        city_hotels: dict = {}
-        for cname in list(cities_to_query)[:5]:
-            key_a = f"_attr_{cname}"
-            key_h = f"_hotel_{cname}"
-            _safe_call(key_a, "get_attractions_by_city", {"city": cname})
-            _safe_call(key_h, "get_hotels_by_city", {"city": cname})
-            result_a = context_parts.pop(key_a, None)
-            result_h = context_parts.pop(key_h, None)
-            if result_a:
-                city_attractions[cname] = result_a
-            if result_h:
-                city_hotels[cname] = result_h
+        # 3. 도시별 점수 기반 명소 ranked top-15 prefetch
+        #    LLM 이 자유 텍스트 보고 가중치/mood_keywords 를 직접 결정하도록
+        #    Day Detail Agent 가 호출할 수도 있지만, prefetch 해두면 cache hit
+        attractions_by_city: dict = {}
+        for cname in cities_to_query:
+            args: dict = {"city": cname, "limit": 15}
+            if primary_theme_key:
+                args["theme_key"] = primary_theme_key
+            if season_quarter:
+                args["season_quarter"] = season_quarter
+            key = f"_attr_{cname}"
+            _safe_call(key, "recommend_attractions", args)
+            res = context_parts.pop(key, None)
+            if res:
+                attractions_by_city[cname] = res
 
-        if city_attractions:
-            context_parts["city_attractions"] = city_attractions
-        if city_hotels:
-            context_parts["city_hotels"] = city_hotels
+        if attractions_by_city:
+            context_parts["recommended_attractions"] = attractions_by_city
 
-        # graph_trace 는 graph_context 에 포함시키지 말고 별도 키로 분리
+        # 4. 사용자 자유 텍스트 → mood keywords / weights 힌트
+        context_parts["__free_text__"] = free_text
+        context_parts["__primary_theme_key__"] = primary_theme_key
+        context_parts["__season_quarter__"] = season_quarter
+        context_parts["__cities_to_query__"] = cities_to_query
         context_parts["__graph_trace__"] = graph_trace
+
         return context_parts
 
     async def invoke_async(self, task, invocation_state=None, **kwargs):
@@ -441,9 +542,18 @@ class CollectContextNode(MultiAgentBase):
             self._collect_context_via_mcp, planning_input
         )
 
-        # graph_trace 분리 — graph_context 에 포함시키면 LLM 프롬프트가 비대해짐
+        # 메타 키 분리 (graph_context 에 포함시키면 LLM 프롬프트가 비대해짐)
         graph_trace = context_parts.pop("__graph_trace__", [])
+        free_text = context_parts.pop("__free_text__", "")
+        primary_theme_key = context_parts.pop("__primary_theme_key__", "")
+        season_quarter = context_parts.pop("__season_quarter__", 0)
+        cities_to_query = context_parts.pop("__cities_to_query__", [])
+
         invocation_state["graph_trace"] = graph_trace
+        invocation_state["natural_language_request"] = free_text
+        invocation_state["primary_theme_key"] = primary_theme_key
+        invocation_state["season_quarter"] = season_quarter
+        invocation_state["cities_in_scope"] = cities_to_query
 
         # Store context for downstream
         invocation_state["graph_context"] = context_parts
@@ -669,10 +779,10 @@ class GenerateSkeletonNode(MultiAgentBase):
         retry_count = invocation_state.get("skeleton_retry_count", 0)
 
         # 유사도 규칙을 reference 의 실제 값과 함께 프롬프트로 재생성.
-        # ParseInputNode 가 만든 rules_prompt 는 reference 값을 모르므로 여기서
-        # 더 강한 버전으로 덮어쓴다.
+        # plan_context_bundle 응답 안의 'reference' 가 v3 reference 모양.
         similarity = int(planning_input.get("similarity_level", 50))
-        ref_raw = graph_context.get("reference_package")
+        bundle_inner = _parse_mcp_text(graph_context.get("plan_context")) or {}
+        ref_raw = bundle_inner.get("reference") if isinstance(bundle_inner, dict) else None
         ref_data = extract_reference_data(ref_raw) if ref_raw else {}
         rules_prompt = format_rules_for_prompt(similarity, reference_data=ref_data)
 
@@ -792,23 +902,60 @@ class GenerateDayDetailsNode(MultiAgentBase):
         super().__init__()
 
     @staticmethod
-    def _compute_max_attractions(day_num: int, total_days: int, skeleton) -> int:
+    def _compute_time_budget(
+        day_num: int, total_days: int, skeleton, num_cities: int = 1
+    ) -> dict:
+        """Compute time budget for a day.
+
+        Returns dict with:
+          available_hours: 가용 시간 (식사 1.5h 미포함, 도시간 이동 미포함)
+          max_attractions: 관광지 수 상한
+          rationale: 계산 근거 텍스트
+        """
+        # 도시간 이동 페널티: 도시 N 개면 (N-1) * 1h 차감
+        intercity_travel_h = max(0, (num_cities - 1)) * 1.0
+
         if day_num == 1:
+            # 도착 후 입국 3h 버퍼
             try:
                 arr_h, _ = map(int, skeleton.departure_flight.arrival_time.split(":"))
-                available_hours = max(0, 22 - (arr_h + 3))
+                end_h = 21  # 식사·휴식 고려해 21시 종료
+                start_h = arr_h + 3
+                available = max(0.0, end_h - start_h - intercity_travel_h)
             except (ValueError, AttributeError):
-                available_hours = 4
-            return max(1, int(available_hours / 2))
+                available = 4.0
+            rationale = "도착 후 3h 버퍼 + 21시 종료 기준"
         elif day_num == total_days:
+            # 출국 3h 전 종료
             try:
                 dep_h, _ = map(int, skeleton.return_flight.departure_time.split(":"))
-                available_hours = max(0, (dep_h - 3) - 9)
+                start_h = 9
+                end_h = dep_h - 3
+                available = max(0.0, end_h - start_h - intercity_travel_h)
             except (ValueError, AttributeError):
-                available_hours = 3
-            return max(1, int(available_hours / 2))
+                available = 3.0
+            rationale = "오전 9시 시작 + 출발 3h 전 종료 기준"
         else:
-            return 6
+            # 09~21 = 12h, 식사 휴식 1.5h, 도시간 이동 차감
+            available = max(0.0, 12.0 - 1.5 - intercity_travel_h)
+            rationale = "09:00~21:00 (식사 1.5h, 도시간 이동 제외)"
+
+        # 명소당 1.5h 관광 + 0.5h 명소간 이동 = 2h
+        max_attr = max(1, int(available / 2.0))
+        return {
+            "available_hours": round(available, 1),
+            "max_attractions": max_attr,
+            "rationale": rationale,
+            "num_cities": num_cities,
+            "intercity_travel_h": round(intercity_travel_h, 1),
+        }
+
+    # Backward-compat thin shim
+    @staticmethod
+    def _compute_max_attractions(day_num: int, total_days: int, skeleton) -> int:
+        return GenerateDayDetailsNode._compute_time_budget(
+            day_num, total_days, skeleton, num_cities=1
+        )["max_attractions"]
 
     @staticmethod
     def _partition_attractions(sorted_allocs, graph_context: dict) -> dict[int, list[str]]:
@@ -893,7 +1040,13 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 next_cities = sorted_allocs[idx + 1].cities
                 next_first_city = [c.strip() for c in next_cities.split(",") if c.strip()][0] if next_cities else ""
 
-            max_attr = self._compute_max_attractions(day_alloc.day, skeleton.days, skeleton)
+            day_city_list = [
+                c.strip() for c in day_alloc.cities.split(",") if c.strip()
+            ]
+            budget = self._compute_time_budget(
+                day_alloc.day, skeleton.days, skeleton, num_cities=len(day_city_list)
+            )
+            max_attr = budget["max_attractions"]
 
             parts = [
                 f"## {day_alloc.day}일차 상세 기획",
@@ -902,7 +1055,10 @@ class GenerateDayDetailsNode(MultiAgentBase):
                 f"- 숙소: {skeleton.hotels[day_alloc.day - 1] if day_alloc.day <= len(skeleton.hotels) else '(귀국일)'}",
                 f"- 항공편: 출발편 도착 {skeleton.departure_flight.arrival_time} / 귀국편 출발 {skeleton.return_flight.departure_time}",
                 f"- 전체 일정: {skeleton.days}일 중 {day_alloc.day}일차",
+                f"- **시간 예산**: 가용 {budget['available_hours']}h "
+                f"(도시 {budget['num_cities']}개, 도시간 이동 -{budget['intercity_travel_h']}h, {budget['rationale']})",
                 f"- **관광지 상한: {max_attr}개** (절대 초과 금지)",
+                f"- 명소당 평균: 관광 1.5h + 이동 0.5h = 2h. stay_minutes 가 있으면 그 값을 사용.",
             ]
 
             if prev_last_city:

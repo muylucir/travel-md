@@ -29,7 +29,8 @@
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
     "recharts": "^3.7.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "undici": "^7.25.0"
   },
   "devDependencies": {
     "@types/cytoscape": "^3.21.9",

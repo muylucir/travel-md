@@ -10,11 +10,21 @@ import { SignatureV4 } from "@smithy/signature-v4";
 import { Sha256 } from "@aws-crypto/sha256-js";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
 import { HttpRequest } from "@smithy/protocol-http";
+import { Agent } from "undici";
 
 const REGION = process.env.AWS_REGION || "ap-northeast-2";
 const AGENT_ARN = process.env.AGENTCORE_AGENT_ARN || "";
 const TREND_COLLECTOR_AGENT_ARN =
   process.env.TREND_COLLECTOR_AGENT_ARN || "";
+
+// undici Agent — Node fetch 의 기본 bodyTimeout(5분)과 headersTimeout(5분)이
+// AgentCore 의 SSE 스트림(7박+ 일정의 Opus 병렬 Day 생성) 중간 idle 에 걸려
+// "UND_ERR_BODY_TIMEOUT" 으로 끊김. 10분으로 확장.
+const longPollAgent = new Agent({
+  bodyTimeout: 600_000,      // 10 min — chunk 사이 idle 허용
+  headersTimeout: 600_000,   // 10 min — initial headers 대기
+  keepAliveTimeout: 30_000,
+});
 
 /**
  * Invoke AgentCore Runtime and return the raw fetch Response.
@@ -64,12 +74,14 @@ export async function invokeAgentCore(
 
   const url = `https://${hostname}${path}?qualifier=DEFAULT`;
   // 7+ night itineraries can take several minutes (parallel Opus per day).
-  // Extend fetch timeout to 10 minutes to prevent premature termination.
+  // Extend fetch + body timeout to 10 minutes to prevent premature termination.
   return fetch(url, {
     method: "POST",
     headers: signed.headers as Record<string, string>,
     body,
-    signal: AbortSignal.timeout(600_000), // 10 minutes
+    signal: AbortSignal.timeout(600_000), // 10 minutes overall
+    // @ts-expect-error -- Node-only undici dispatcher; not in standard fetch types
+    dispatcher: longPollAgent,
   });
 }
 
@@ -123,5 +135,8 @@ export async function invokeTrendCollector(
     method: "POST",
     headers: signed.headers as Record<string, string>,
     body,
+    signal: AbortSignal.timeout(600_000),
+    // @ts-expect-error -- Node-only undici dispatcher
+    dispatcher: longPollAgent,
   });
 }

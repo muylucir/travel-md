@@ -228,10 +228,12 @@ def extract_reference_data(reference_raw: object) -> dict:
     if hotels:
         out["hotels"] = hotels
 
-    # Attractions: name list (v3 attractions[] or legacy)
+    # Attractions: prefer scheduledAttractions[] (v3 redesign), else attractions[]
     attrs: list[str] = []
     seen_a: set[str] = set()
-    for a in data.get("attractions", []) or []:
+    for a in (data.get("scheduledAttractions") or []) or (
+        data.get("attractions") or []
+    ):
         if isinstance(a, dict) and a.get("name") and a["name"] not in seen_a:
             seen_a.add(str(a["name"]))
             attrs.append(str(a["name"]))

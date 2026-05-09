@@ -21,14 +21,18 @@ import logging
 import traceback
 
 from tools.graph_tools import (
-    get_package,
-    search_packages,
-    get_routes_by_region,
-    get_attractions_by_city,
-    get_hotels_by_city,
-    get_similar_packages,
-    get_nearby_cities,
-    get_cities_by_country,
+    # Skeleton phase
+    get_reference_package,
+    find_similar_packages,
+    recommend_route,
+    # Day Detail phase
+    recommend_attractions,
+    recommend_hotels,
+    get_attraction_neighbors,
+    get_attraction_detail,
+    # Meta
+    explain_score,
+    plan_context_bundle,
     invalidate_cache,
 )
 from tools.dynamodb_tools import (
@@ -42,16 +46,18 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 TOOL_REGISTRY = {
-    # Graph read tools (8)
-    "get_package": get_package,
-    "search_packages": search_packages,
-    "get_routes_by_region": get_routes_by_region,
-    "get_attractions_by_city": get_attractions_by_city,
-    "get_hotels_by_city": get_hotels_by_city,
-    "get_similar_packages": get_similar_packages,
-    "get_nearby_cities": get_nearby_cities,
-    "get_cities_by_country": get_cities_by_country,
-    # Cache management (1)
+    # Skeleton phase (3)
+    "get_reference_package": get_reference_package,
+    "find_similar_packages": find_similar_packages,
+    "recommend_route": recommend_route,
+    # Day Detail phase (4)
+    "recommend_attractions": recommend_attractions,
+    "recommend_hotels": recommend_hotels,
+    "get_attraction_neighbors": get_attraction_neighbors,
+    "get_attraction_detail": get_attraction_detail,
+    # Meta (3)
+    "explain_score": explain_score,
+    "plan_context_bundle": plan_context_bundle,
     "invalidate_cache": invalidate_cache,
     # DynamoDB tools (4)
     "save_product": save_product,

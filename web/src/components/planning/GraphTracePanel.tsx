@@ -289,36 +289,46 @@ function buildSubgraphFromTrace(trace: GraphTraceCall[]): {
     links.push({ id: key, source, target, label });
   }
 
-  // 도구 호출 인자에서 정점/링크 추론
+  // 도구 호출 인자에서 정점/링크 추론 (Score-First redesign)
   for (const call of trace) {
     const args = call.arguments || {};
     switch (call.tool) {
-      case "get_package":
-      case "get_similar_packages": {
-        const code = String(args.saleProdCd || args.package_code || "");
+      case "get_reference_package":
+      case "find_similar_packages": {
+        const code = String(args.saleProdCd || "");
         if (code) addNode(`SaleProduct:${code}`, "SaleProduct", code);
         break;
       }
-      case "search_packages": {
-        const dest = String(args.destination || "");
-        if (dest) addNode(`City:${dest}`, "City", dest);
+      case "plan_context_bundle": {
+        const code = String(args.saleProdCd || "");
+        if (code) addNode(`SaleProduct:${code}`, "SaleProduct", code);
+        const ac = String(args.arrival_city || "");
+        if (ac) addNode(`City:${ac}`, "City", ac);
+        if (args.theme_key)
+          addNode(`Theme:${args.theme_key}`, "Theme", String(args.theme_key));
         break;
       }
-      case "get_routes_by_region": {
-        const ac = String(args.arrival_city || args.region || "");
+      case "recommend_route": {
+        const ac = String(args.arrival_city || "");
         if (ac) addNode(`City:${ac}`, "City", ac);
         break;
       }
-      case "get_attractions_by_city":
-      case "get_hotels_by_city":
-      case "get_nearby_cities": {
+      case "recommend_attractions":
+      case "recommend_hotels": {
         const c = String(args.city || "");
         if (c) addNode(`City:${c}`, "City", c);
+        if (args.theme_key)
+          addNode(`Theme:${args.theme_key}`, "Theme", String(args.theme_key));
         break;
       }
-      case "get_cities_by_country": {
-        const c = String(args.country || "");
-        if (c) addNode(`Country:${c}`, "Country", c);
+      case "get_attraction_neighbors":
+      case "get_attraction_detail":
+      case "explain_score": {
+        const aid = String(args.attraction_id || "");
+        if (aid) {
+          const norm = aid.startsWith("Attraction:") ? aid : `Attraction:${aid}`;
+          addNode(norm, "Attraction", aid);
+        }
         break;
       }
     }
