@@ -188,7 +188,15 @@ class PlanningOutput(BaseModel):
     region: str = Field(default="")
 
     # --- Agent meta fields ---
-    similarity_score: int = Field(default=50, description="Similarity score applied")
+    similarity_score: int = Field(default=50, description="Requested similarity (slider value).")
+    achieved_similarity: int = Field(
+        default=0,
+        description="Layer-weighted Jaccard score between this output and the reference (0..100).",
+    )
+    similarity_breakdown: dict = Field(
+        default_factory=dict,
+        description="Per-layer Jaccard percentages (route/hotel/attraction).",
+    )
     reference_products: List[str] = Field(default_factory=list, description="Reference product codes")
     changes_summary: ChangesSummary = Field(default_factory=ChangesSummary)
     graph_trace: List[dict] = Field(
@@ -212,16 +220,18 @@ class SkeletonDayAllocation(BaseModel):
 
 
 class SkeletonOutput(BaseModel):
-    """Phase 1 output: travel structure without per-day attraction details."""
+    """Phase 1 output: travel structure (final slim).
 
-    package_name: str = Field(..., description="Package product name")
-    description: str = Field(default="", description="One-paragraph summary")
+    Owns only the grounded routing facts: nights/days/cities/flights/
+    hotels/brand/similarity_score/reference_products. Everything else
+    is decided post-aggregate by :class:`SynthesizeOutput` or filled
+    deterministically by :mod:`src.synthesis.business_meta`.
+    """
+
     nights: int = Field(..., description="Number of nights")
     days: int = Field(..., description="Number of days")
-    duration: str = Field(default="", description="e.g. '3박 4일'")
 
     airline: str = Field(default="", description="Airline name")
-    airline_type: str = Field(default="", description="FSC/LCC")
     departure_flight: FlightDetail = Field(default_factory=FlightDetail)
     return_flight: FlightDetail = Field(default_factory=FlightDetail)
 
@@ -230,25 +240,47 @@ class SkeletonOutput(BaseModel):
     hotels: List[str] = Field(default_factory=list, description="Hotel names per night")
     day_allocations: List[SkeletonDayAllocation] = Field(default_factory=list, description="City assignment per day")
 
-    pricing: Pricing = Field(default_factory=Pricing)
     brand: str = Field(default="", description="v3 Brand: '세이브' or '스탠다드'")
-    shopping_count: int = Field(default=0, description="(deprecated)")
-    guide_fee: GuideFee = Field(default_factory=GuideFee)
 
-    country: str = Field(default="")
-    region: str = Field(default="")
     similarity_score: int = Field(default=50)
     reference_products: List[str] = Field(default_factory=list)
 
-    inclusions: List[CostItem] = Field(default_factory=list)
-    exclusions: List[CostItem] = Field(default_factory=list)
-    optional_costs: List[CostItem] = Field(default_factory=list)
-    insurance: Insurance = Field(default_factory=Insurance)
-    meeting_info: MeetingInfo = Field(default_factory=MeetingInfo)
-    booking_policy: BookingPolicy = Field(default_factory=BookingPolicy)
-    destination_cities: List[DestinationCity] = Field(default_factory=list)
 
-    changes_summary: ChangesSummary = Field(default_factory=ChangesSummary)
+class SynthesizeOutput(BaseModel):
+    """LLM output that runs after day_details PASS.
+
+    Stage 4 scope: all the day-aware judgment fields. SynthesizeNode
+    splats these onto the merged ``PlanningOutput``. The agent must
+    not change cities / hotels / flights / itinerary — those are
+    grounded by skeleton + day workers.
+    """
+
+    package_name: str = Field(..., description="상품명 (테마/시즌 반영)")
+    description: str = Field(default="", description="1문단 요약")
+    hashtags: List[str] = Field(
+        default_factory=list, description="해시태그 (각 항목은 # 포함 또는 미포함 모두 OK)"
+    )
+    highlights: List[str] = Field(
+        default_factory=list,
+        description="대표 셀링 포인트 5-8줄. 실제 itinerary 의 명소/도시 기반.",
+    )
+    pricing: Pricing = Field(
+        default_factory=Pricing,
+        description="similar.candidates 가격을 anchor 로. invent 금지.",
+    )
+    inclusions: List[CostItem] = Field(
+        default_factory=list,
+        description="실 itinerary 와 항공편 기반. 일정에 없는 도시/명소 언급 금지.",
+    )
+    exclusions: List[CostItem] = Field(default_factory=list)
+    optional_costs: List[CostItem] = Field(
+        default_factory=list,
+        description="itinerary 의 명소·hotel 인근 옵션만. itinerary 외 명소 추가 금지.",
+    )
+    changes_summary: ChangesSummary = Field(
+        default_factory=ChangesSummary,
+        description="reference 대비 무엇을 유지/변경했는지.",
+    )
 
 
 # ─── Phase 2: Day Detail Output ───
@@ -271,8 +303,22 @@ class DayDetailOutput(BaseModel):
 def merge_skeleton_and_days(
     skeleton: SkeletonOutput,
     day_details: List[DayDetailOutput],
+    planning_input: dict | None = None,
 ) -> PlanningOutput:
-    """Assemble a complete PlanningOutput from skeleton + day details."""
+    """Assemble a complete PlanningOutput from skeleton + day details.
+
+    Stage 1 of the Skeleton-slim refactor: business-meta fields
+    (meeting_info, booking_policy, insurance, guide_fee,
+    destination_cities, country, region, airline_type, duration, …) are
+    no longer carried on ``skeleton``. They're filled here from
+    :func:`src.synthesis.business_meta.fill_business_meta`, which only
+    consumes deterministic inputs (depart-airport hint, airline code,
+    city list).
+    """
+    # Local import keeps the model layer free of synthesis-side deps when
+    # mypy / pyright analyses output.py in isolation.
+    from src.synthesis.business_meta import fill_business_meta
+
     itinerary: List[DayItinerary] = []
     all_attractions: List[Attraction] = []
     all_highlights: List[str] = []
@@ -301,42 +347,44 @@ def merge_skeleton_and_days(
     # Aggregate trend info from day details (order-preserving dedup)
     unique_trends = list(dict.fromkeys(all_trend_spots))
 
-    # Update changes_summary with trend info
-    merged_changes = skeleton.changes_summary.model_copy(
-        update={"trend_added": unique_trends}
+    business_meta = fill_business_meta(planning_input or {}, skeleton)
+
+    # Stage 3: package_name / description / hashtags / changes_summary
+    # are filled by SynthesizeNode. Provide safe placeholders here so
+    # the model validates if synthesize is somehow skipped.
+    placeholder_changes = ChangesSummary(
+        trend_added=unique_trends,
+        similarity_applied=skeleton.similarity_score,
+    )
+    placeholder_name = (
+        f"{'-'.join(skeleton.city_list[:3])} {skeleton.nights}박 {skeleton.days}일"
+        if skeleton.city_list
+        else "AI 기획 상품"
     )
 
     return PlanningOutput(
-        package_name=skeleton.package_name,
-        description=skeleton.description,
+        package_name=placeholder_name,
+        description="",
+        hashtags=[],
         nights=skeleton.nights,
         days=skeleton.days,
-        duration=skeleton.duration,
         airline=skeleton.airline,
-        airline_type=skeleton.airline_type,
         departure_flight=skeleton.departure_flight,
         return_flight=skeleton.return_flight,
         travel_cities=skeleton.travel_cities,
         city_list=skeleton.city_list,
-        pricing=skeleton.pricing,
+        pricing=Pricing(),  # filled by SynthesizeNode
         brand=skeleton.brand,
-        shopping_count=skeleton.shopping_count,
-        guide_fee=skeleton.guide_fee,
         hotels=skeleton.hotels,
         itinerary=itinerary,
         attractions=unique_attractions,
         highlights=all_highlights[:10],
-        inclusions=skeleton.inclusions,
-        exclusions=skeleton.exclusions,
-        optional_costs=skeleton.optional_costs,
-        insurance=skeleton.insurance,
-        meeting_info=skeleton.meeting_info,
-        booking_policy=skeleton.booking_policy,
-        destination_cities=skeleton.destination_cities,
-        country=skeleton.country,
-        region=skeleton.region,
+        inclusions=[],  # filled by SynthesizeNode
+        exclusions=[],
+        optional_costs=[],
         similarity_score=skeleton.similarity_score,
         reference_products=skeleton.reference_products,
-        changes_summary=merged_changes,
+        changes_summary=placeholder_changes,
         trend_sources=unique_trends,
+        **business_meta,
     )

@@ -11,7 +11,6 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import FormMode from "./FormMode";
 import ChatMode from "./ChatMode";
 import ResultPanel from "./ResultPanel";
-import ProgressBar from "./ProgressBar";
 import type { PlanningInput, PlanningOutput } from "@/lib/types";
 
 export default function PlanningPage() {
@@ -66,16 +65,6 @@ export default function PlanningPage() {
       }
     >
       <SpaceBetween size="l">
-        {/* Form mode progress bar */}
-        {activeTab === "form" && (isFormRunning || formPlanning.error) && (
-          <ProgressBar
-            status={formPlanning.status}
-            step={formPlanning.progress.step}
-            percent={formPlanning.progress.percent}
-            errorMessage={formPlanning.error || undefined}
-          />
-        )}
-
         <Grid
           gridDefinition={
             hasResult
@@ -111,6 +100,12 @@ export default function PlanningPage() {
                     <FormMode
                       onSubmit={handleFormSubmit}
                       disabled={isFormRunning}
+                      progress={{
+                        status: formPlanning.status,
+                        step: formPlanning.progress.step,
+                        percent: formPlanning.progress.percent,
+                        errorMessage: formPlanning.error || undefined,
+                      }}
                     />
                   ),
                 },

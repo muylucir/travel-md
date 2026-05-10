@@ -200,7 +200,9 @@ def get_reference_package(saleProdCd: str = "", package_code: str = "") -> str:
 
     attr_rows = execute_query(
         "MATCH (p:SaleProduct {saleProdCd: $code})-[r:HAS_SCHEDULED_ATTRACTION]->(a:Attraction) "
-        "RETURN a, r.schdDay AS schdDay, r.schtExprSqc AS schtExprSqc "
+        "OPTIONAL MATCH (a)-[:IN_CITY]->(c:City) "
+        "RETURN a, c.name AS cityName, "
+        "       r.schdDay AS schdDay, r.schtExprSqc AS schtExprSqc "
         "ORDER BY r.schdDay, r.schtExprSqc",
         params,
     )
@@ -209,6 +211,9 @@ def get_reference_package(saleProdCd: str = "", package_code: str = "") -> str:
         ad = extract_node(row, "a")
         ad["schdDay"] = row.get("schdDay")
         ad["schtExprSqc"] = row.get("schtExprSqc")
+        # Tag with the resolved city so downstream similarity preservation
+        # can place each attraction on a day whose cities match.
+        ad["cityName"] = row.get("cityName")
         scheduled_attractions.append(ad)
 
     stay_rows = execute_query(
@@ -1062,6 +1067,92 @@ def explain_score(
     result_str = _attach_trace(payload)
     _cache_set(cache_key, result_str, CACHE_TTL["explain_score"])
     return result_str
+
+
+# =============================================================================
+# 8b. validate_city_scope
+# =============================================================================
+
+def validate_city_scope(
+    day_attractions: dict,
+    day_cities: dict,
+) -> str:
+    """Verify each day's attractions belong to that day's cities.
+
+    Args:
+        day_attractions: ``{"1": ["기요미즈데라", ...], "2": [...]}`` — names per day.
+        day_cities:      ``{"1": ["오사카","교토"], "2": ["교토"]}`` — allowed cities per day.
+
+    Returns JSON: ``{"issues": [{"day", "name", "actual_cities", "reason"}], "missing": [...]}``
+    """
+    if not isinstance(day_attractions, dict) or not isinstance(day_cities, dict):
+        return json.dumps(
+            {"error": "day_attractions/day_cities must be dicts"},
+            ensure_ascii=False,
+        )
+
+    # Collect every distinct attraction name across days
+    all_names: set[str] = set()
+    parsed_attrs: dict[int, list[str]] = {}
+    parsed_cities: dict[int, set[str]] = {}
+    for k, v in day_attractions.items():
+        try:
+            d = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, list):
+            names = [str(n) for n in v if n]
+            parsed_attrs[d] = names
+            all_names.update(names)
+    for k, v in day_cities.items():
+        try:
+            d = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, list):
+            parsed_cities[d] = {str(c).strip() for c in v if c}
+        elif isinstance(v, str):
+            parsed_cities[d] = {c.strip() for c in v.split(",") if c.strip()}
+
+    if not all_names:
+        return _attach_trace({"issues": [], "missing": []})
+
+    reset_trace()
+    rows = execute_query(
+        "MATCH (a:Attraction)-[:IN_CITY]->(c:City) "
+        "WHERE a.name IN $names "
+        "RETURN a.name AS name, collect(DISTINCT c.name) AS cities",
+        {"names": sorted(all_names)},
+    )
+    name_to_cities: dict[str, set[str]] = {}
+    for r in rows:
+        name = r.get("name")
+        cs = {c for c in (r.get("cities") or []) if c}
+        if name:
+            name_to_cities[name] = cs
+
+    issues: list[dict] = []
+    missing: list[dict] = []
+    for day_num, names in parsed_attrs.items():
+        allowed = parsed_cities.get(day_num, set())
+        if not allowed:
+            continue
+        for name in names:
+            actual = name_to_cities.get(name)
+            if actual is None:
+                missing.append({"day": day_num, "name": name})
+                continue
+            if not (actual & allowed):
+                issues.append(
+                    {
+                        "day": day_num,
+                        "name": name,
+                        "actual_cities": sorted(actual),
+                        "expected_cities": sorted(allowed),
+                    }
+                )
+
+    return _attach_trace({"issues": issues, "missing": missing})
 
 
 # =============================================================================

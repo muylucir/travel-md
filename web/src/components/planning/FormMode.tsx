@@ -28,6 +28,8 @@ import {
 import SimilaritySlider from "../common/SimilaritySlider";
 import { usePackages } from "@/hooks/usePackages";
 import RecommendedPackageCards from "./RecommendedPackageCards";
+import ProgressBar from "./ProgressBar";
+import type { PlanningStatus } from "@/hooks/usePlanning";
 
 // 시즌 → BEST_IN_SEASON.quarter 매핑
 const SEASON_QUARTER_MAP: Record<string, number> = {
@@ -40,9 +42,16 @@ const SEASON_QUARTER_MAP: Record<string, number> = {
 interface FormModeProps {
   onSubmit: (input: PlanningInput) => void;
   disabled?: boolean;
+  /** Progress bar shown right above the submit button while planning runs. */
+  progress?: {
+    status: PlanningStatus;
+    step: string;
+    percent: number;
+    errorMessage?: string;
+  } | null;
 }
 
-export default function FormMode({ onSubmit, disabled }: FormModeProps) {
+export default function FormMode({ onSubmit, disabled, progress }: FormModeProps) {
   const [region] = useState<string>("일본"); // 간사이 4도시 고정
   const [destination, setDestination] = useState<string>("");
   const [nights, setNights] = useState("3");
@@ -169,6 +178,9 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
 
   const isValid =
     destination && season && nights && days && conflictWarnings.length === 0;
+
+  const showProgress =
+    !!progress && (progress.status === "running" || progress.status === "error");
 
   return (
     <Form
@@ -322,6 +334,7 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
             <SimilaritySlider
               value={similarityLevel}
               onChange={setSimilarityLevel}
+              referenceProductId={referenceProductId}
             />
 
             {conflictWarnings.length > 0 && (
@@ -501,6 +514,16 @@ export default function FormMode({ onSubmit, disabled }: FormModeProps) {
             </FormField>
           </SpaceBetween>
         </Container>
+
+        {/* Progress bar — full form width, sits right above the submit button. */}
+        {showProgress && progress && (
+          <ProgressBar
+            status={progress.status}
+            step={progress.step}
+            percent={progress.percent}
+            errorMessage={progress.errorMessage}
+          />
+        )}
       </SpaceBetween>
     </Form>
   );

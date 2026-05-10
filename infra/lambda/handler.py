@@ -34,6 +34,7 @@ from tools.graph_tools import (
     explain_score,
     plan_context_bundle,
     invalidate_cache,
+    validate_city_scope,
 )
 from tools.dynamodb_tools import (
     save_product,
@@ -59,6 +60,7 @@ TOOL_REGISTRY = {
     "explain_score": explain_score,
     "plan_context_bundle": plan_context_bundle,
     "invalidate_cache": invalidate_cache,
+    "validate_city_scope": validate_city_scope,
     # DynamoDB tools (4)
     "save_product": save_product,
     "get_product": get_product,

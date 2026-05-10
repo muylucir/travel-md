@@ -1,4 +1,12 @@
-"""5-Layer Similarity Dial: determines which layers to retain vs. modify.
+"""5-Layer Similarity Dial — gradient (ratio-based) version.
+
+Earlier this module returned a per-layer ``"retain"|"modify"`` decision based
+on a single threshold, which produced an awkward cliff: similarity 49 vs 50
+flipped a whole layer between full keep and full replace. The current version
+returns a continuous **retain ratio** in ``[0, 1]`` per layer, which lets the
+skeleton/day stages preserve a fraction of the reference (e.g. 7/14 attractions
+when similarity=50%). The legacy ``compute_change_rules`` function is kept as
+a thin compatibility shim built on top of the ratios.
 
 Layer structure
 ---------------
@@ -9,6 +17,9 @@ Layer 4 -- activity               : weight 0.30 -- easy to swap; trend insertion
 Layer 5 -- theme                  : weight 0.10 -- always changeable
 """
 
+from __future__ import annotations
+
+import json as _json
 from typing import Dict
 
 LAYER_WEIGHTS: Dict[str, float] = {
@@ -27,130 +38,134 @@ LAYER_DESCRIPTIONS: Dict[str, str] = {
     "theme": "분위기/테마 (항상 변경 가능)",
 }
 
-LAYER_TOOL_MAP: Dict[str, list] = {
-    "route": ["get_routes_by_region", "get_nearby_cities"],
-    "hotel": ["get_hotels_by_city"],
-    "attraction": ["get_attractions_by_city"],
-    "activity": ["get_attractions_by_city"],
-    "theme": ["search_packages", "get_attractions_by_city"],
+# Per-layer offsets shape the gradient: heavier layers (route, hotel) keep
+# more even at low similarity; lighter layers (theme, activity) only kick in
+# at higher similarity. Tuned so similarity=50% lands at the layer's nominal
+# weight (0.95, 0.70, 0.50, 0.30, 0.10).
+_LAYER_OFFSETS: Dict[str, float] = {
+    "route":      0.45,
+    "hotel":      0.20,
+    "attraction": 0.0,
+    "activity":   -0.20,
+    "theme":      -0.40,
 }
 
 
-def compute_change_rules(similarity: int) -> Dict[str, str]:
-    """Determine retain/modify decision for each layer given a similarity level.
+def compute_retain_ratio(similarity: int) -> Dict[str, float]:
+    """Return per-layer retain ratio in [0, 1].
 
-    Parameters
-    ----------
-    similarity:
-        0-100 integer. 100 means nearly identical to reference; 0 means
-        completely new.
-
-    Returns
-    -------
-    dict mapping layer name to either ``"retain"`` or ``"modify"``.
+    Each layer's ratio = clamp(similarity/100 + offset, 0, 1).  The offsets
+    are sized so that at similarity=50 each layer matches its nominal weight,
+    giving a smooth gradient instead of an on/off threshold.
     """
-    threshold = 1.0 - (similarity / 100)
+    s = max(0, min(100, int(similarity))) / 100.0
     return {
-        layer: "retain" if weight > threshold else "modify"
-        for layer, weight in LAYER_WEIGHTS.items()
+        layer: max(0.0, min(1.0, s + offset))
+        for layer, offset in _LAYER_OFFSETS.items()
     }
+
+
+def keep_count(ratio: float, total: int) -> int:
+    """Round a ratio×total to a non-negative integer count."""
+    if total <= 0:
+        return 0
+    return max(0, min(total, round(total * float(ratio))))
+
+
+def compute_change_rules(similarity: int) -> Dict[str, str]:
+    """Legacy boolean view of the gradient (ratio >= 0.5 → 'retain').
+
+    Kept for back-compat with code/UI that branches on retain/modify.
+    New code should use :func:`compute_retain_ratio` directly.
+    """
+    ratios = compute_retain_ratio(similarity)
+    return {layer: ("retain" if r >= 0.5 else "modify") for layer, r in ratios.items()}
+
+
+def select_preserved(reference_items: list, ratio: float) -> list:
+    """Pick the first round(len*ratio) items from a reference list.
+
+    The reference list is assumed to already be in priority order (graph
+    score, schedule order, etc.), so taking the head preserves the most
+    important items at any given ratio.
+    """
+    if not reference_items:
+        return []
+    n = keep_count(ratio, len(reference_items))
+    return list(reference_items[:n])
 
 
 def format_rules_for_prompt(
     similarity: int,
     reference_data: dict | None = None,
 ) -> str:
-    """Format the 5-Layer change rules into a human-readable string for LLM prompt injection.
+    """Render gradient retain rules + reference values for LLM prompt injection.
 
-    Parameters
-    ----------
-    similarity:
-        0-100 integer.
-    reference_data:
-        Optional dict with concrete reference values for retain layers.
-        Expected keys (all optional):
-          - cities: list[str]                 (L1)
-          - departure_flight, return_flight: str  (L1)
-          - hotels: list[str]                 (L2)
-          - attractions: list[str]            (L3)
-          - activities: list[str]             (L4)
-          - themes: list[str]                 (L5)
-        For each retain layer, the prompt is augmented with a
-        "**MUST USE EXACTLY**" directive listing those values.
-
-    Returns
-    -------
-    A multi-line string suitable for embedding in a system or user prompt.
+    Each layer shows ``kept N / total`` with the concrete preserved values,
+    so the model can be told "include exactly these names; everything else
+    is yours to design freely".
     """
-    rules = compute_change_rules(similarity)
-    threshold = 1.0 - (similarity / 100)
+    ratios = compute_retain_ratio(similarity)
 
     lines = [
-        f"## 유사도 규칙 (similarity={similarity}%, threshold={threshold:.2f})",
+        f"## 유사도 규칙 (similarity={similarity}%, 그라디언트)",
         "",
-        "이 규칙은 **시스템 강제 사항**입니다. 위반 시 후처리 검증에서 차단됩니다.",
+        "각 layer 별로 reference 의 일부만 보존하고 나머지는 자유롭게 재구성합니다.",
+        "보존 항목 리스트는 **이름까지 정확히 그대로** 사용하세요. 누락 시 검증 실패.",
         "",
     ]
 
-    for layer, decision in rules.items():
+    layer_to_keys = {
+        "route": ("cities", "도시 (city_list 에 그대로 포함)"),
+        "hotel": ("hotels", "호텔 (hotels 배열에 그대로 포함)"),
+        "attraction": ("attractions", "핵심 관광지 (itinerary 의 attractions 에 모두 등장)"),
+        "activity": ("activities", "액티비티"),
+        "theme": ("themes", "테마/분위기"),
+    }
+
+    for layer, ratio in ratios.items():
         weight = LAYER_WEIGHTS[layer]
         desc = LAYER_DESCRIPTIONS[layer]
-        icon = "RETAIN" if decision == "retain" else "MODIFY"
-        tool_hint = ""
-        if decision == "modify" and layer in LAYER_TOOL_MAP:
-            tools = ", ".join(LAYER_TOOL_MAP[layer])
-            tool_hint = f" → 활용 도구: {tools}"
-        lines.append(f"- Layer [{layer}] (weight={weight:.2f}) {desc}: **{icon}**{tool_hint}")
+        ref_key, ref_label = layer_to_keys.get(layer, ("", ""))
+        ref_list = (reference_data or {}).get(ref_key) or []
+        total = len(ref_list)
+        keep_n = keep_count(ratio, total)
 
-    lines.append("")
+        if total == 0:
+            lines.append(
+                f"- Layer [{layer}] (weight={weight:.2f}) {desc}: ratio={ratio:.2f} (reference 정보 없음)"
+            )
+            continue
 
-    retained = [l for l, d in rules.items() if d == "retain"]
-    modified = [l for l, d in rules.items() if d == "modify"]
-
-    if retained:
-        lines.append(f"유지 대상: {', '.join(retained)}")
-    if modified:
-        lines.append(f"변경 대상: {', '.join(modified)}")
-
-    lines.append("")
-
-    # ─── 유지 레이어의 구체적 값을 reference 에서 주입 ─────────────────────
-    if reference_data and retained:
-        lines.append("## 유지 레이어 — 아래 값을 **그대로 (변경 없이) 사용**하세요")
-        lines.append("")
-        layer_to_keys = {
-            "route": [
-                ("cities", "방문 도시 (city_list 에 그대로 사용)"),
-                ("departure_flight", "출발 항공편"),
-                ("return_flight", "귀국 항공편"),
-            ],
-            "hotel": [("hotels", "호텔 (hotels 배열에 그대로 사용)")],
-            "attraction": [
-                ("attractions", "핵심 관광지 (itinerary 의 attractions 에 모두 포함)")
-            ],
-            "activity": [("activities", "세부 액티비티")],
-            "theme": [("themes", "테마/분위기 키워드")],
-        }
-        for layer in retained:
-            for key, label in layer_to_keys.get(layer, []):
-                value = reference_data.get(key)
-                if value is None or (isinstance(value, list) and len(value) == 0):
-                    continue
-                if isinstance(value, list):
-                    lines.append(
-                        f"- **{label}** (Layer {layer}): "
-                        + ", ".join(f"`{v}`" for v in value)
-                    )
-                else:
-                    lines.append(f"- **{label}** (Layer {layer}): `{value}`")
-        lines.append("")
-        lines.append(
-            "위 값을 누락하거나 다른 값으로 대체하면 검증에 실패하여 재생성 비용이 발생합니다."
+        preserved = list(ref_list[:keep_n])
+        replaced_n = total - keep_n
+        line = (
+            f"- Layer [{layer}] (weight={weight:.2f}) {desc}: "
+            f"ratio={ratio:.2f} → **보존 {keep_n}/{total}**"
         )
-        lines.append("")
+        if replaced_n > 0:
+            line += f", 신규 {replaced_n}개 추가 가능"
+        lines.append(line)
+        if preserved:
+            lines.append(
+                f"  · {ref_label} — 보존: " + ", ".join(f"`{v}`" for v in preserved)
+            )
+        if replaced_n > 0 and ref_list[keep_n:]:
+            sample = ref_list[keep_n:keep_n + 3]
+            extra = "..." if replaced_n > 3 else ""
+            lines.append(
+                f"  · 변경 가능한 reference 항목: "
+                + ", ".join(f"`{v}`" for v in sample)
+                + extra
+            )
 
-    lines.append("변경 대상 레이어는 기존 상품과 다르게 재구성하세요.")
-    lines.append("유지 대상 레이어는 기존 상품의 요소를 **이름까지 정확히 그대로** 사용하세요.")
+    lines.append("")
+    lines.append(
+        "위에서 ‘보존’ 으로 명시된 모든 항목은 결과에 정확한 이름으로 포함되어야 합니다."
+    )
+    lines.append(
+        "보존 외 슬롯은 사용자 자유 텍스트·테마·시즌 가중치로 자유롭게 재구성하세요."
+    )
 
     return "\n".join(lines)
 
@@ -165,8 +180,6 @@ def extract_reference_data(reference_raw: object) -> dict:
     Returns a dict with keys: cities, hotels, attractions
     (departure_flight/return_flight/themes/activities reserved for future).
     """
-    import json as _json
-
     data: dict
     if isinstance(reference_raw, str):
         try:
@@ -229,15 +242,80 @@ def extract_reference_data(reference_raw: object) -> dict:
         out["hotels"] = hotels
 
     # Attractions: prefer scheduledAttractions[] (v3 redesign), else attractions[]
+    # Track each attraction's city so similarity preservation can place it on
+    # a day whose cities actually contain it.
     attrs: list[str] = []
+    attr_cities: dict[str, str] = {}
     seen_a: set[str] = set()
     for a in (data.get("scheduledAttractions") or []) or (
         data.get("attractions") or []
     ):
-        if isinstance(a, dict) and a.get("name") and a["name"] not in seen_a:
-            seen_a.add(str(a["name"]))
-            attrs.append(str(a["name"]))
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name")
+        if not name or name in seen_a:
+            continue
+        seen_a.add(str(name))
+        attrs.append(str(name))
+        city = a.get("cityName") or a.get("city")
+        if city:
+            attr_cities[str(name)] = str(city)
     if attrs:
         out["attractions"] = attrs
+    if attr_cities:
+        out["attraction_cities"] = attr_cities
 
     return out
+
+
+def compute_achieved_similarity(
+    output_obj, reference_data: dict
+) -> dict:
+    """Compute the actual layer-weighted Jaccard between output and reference.
+
+    Returns ``{"achieved": 0..100, "breakdown": {layer: 0..100}}``.  Only the
+    three layers that have concrete reference data (route/hotel/attraction)
+    contribute; lighter layers (activity/theme) are summarized in the LLM's
+    free-text changes_summary instead.
+    """
+    def jaccard(a: set, b: set) -> float:
+        if not a and not b:
+            return 1.0
+        return len(a & b) / max(1, len(a | b))
+
+    ref_cities = set(reference_data.get("cities") or [])
+    out_cities = set(getattr(output_obj, "city_list", None) or [])
+    route = jaccard(ref_cities, out_cities)
+
+    ref_hotels = set(reference_data.get("hotels") or [])
+    out_hotels = set(getattr(output_obj, "hotels", None) or [])
+    hotel = jaccard(ref_hotels, out_hotels)
+
+    ref_attrs = set(reference_data.get("attractions") or [])
+    out_attrs: set[str] = set()
+    for d in getattr(output_obj, "itinerary", None) or []:
+        for n in getattr(d, "attractions", None) or []:
+            if n:
+                out_attrs.add(n)
+    attr = jaccard(ref_attrs, out_attrs)
+
+    weights = {
+        "route": LAYER_WEIGHTS["route"],
+        "hotel": LAYER_WEIGHTS["hotel"],
+        "attraction": LAYER_WEIGHTS["attraction"],
+    }
+    weight_sum = sum(weights.values())
+    weighted = (
+        route * weights["route"]
+        + hotel * weights["hotel"]
+        + attr * weights["attraction"]
+    ) / weight_sum if weight_sum else 0.0
+
+    return {
+        "achieved": int(round(weighted * 100)),
+        "breakdown": {
+            "route": int(round(route * 100)),
+            "hotel": int(round(hotel * 100)),
+            "attraction": int(round(attr * 100)),
+        },
+    }

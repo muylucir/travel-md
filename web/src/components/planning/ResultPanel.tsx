@@ -77,7 +77,38 @@ export default function ResultPanel({ result }: ResultPanelProps) {
             </div>
             <div>
               <Box variant="awsui-key-label">유사도</Box>
-              <Box variant="p">{result.similarity_score}%</Box>
+              <Box variant="p">
+                요청 {result.similarity_score}%
+                {typeof result.achieved_similarity === "number" && (
+                  <>
+                    {" / "}
+                    실제{" "}
+                    <strong
+                      style={{
+                        color:
+                          Math.abs(
+                            result.achieved_similarity - result.similarity_score
+                          ) <= 10
+                            ? "#0f5132"
+                            : "#d13212",
+                      }}
+                    >
+                      {result.achieved_similarity}%
+                    </strong>
+                  </>
+                )}
+              </Box>
+              {result.similarity_breakdown && (
+                <Box
+                  variant="small"
+                  color="text-body-secondary"
+                  margin={{ top: "xxs" }}
+                >
+                  도시 {result.similarity_breakdown.route ?? 0}% · 호텔{" "}
+                  {result.similarity_breakdown.hotel ?? 0}% · 명소{" "}
+                  {result.similarity_breakdown.attraction ?? 0}%
+                </Box>
+              )}
             </div>
           </ColumnLayout>
 

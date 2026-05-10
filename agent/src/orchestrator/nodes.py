@@ -17,24 +17,27 @@ from strands.multiagent.base import MultiAgentBase, MultiAgentResult, NodeResult
 from strands.types.content import ContentBlock, Message
 
 from src.agents.chat_parser import create_chat_parser_agent
-from src.agents.itinerary import create_itinerary_agent
 from src.agents.skeleton import create_skeleton_agent
 from src.agents.day_detail import create_day_detail_agent
 from src.models.input import PlanningInput
 from src.models.output import (
+    ChangesSummary,
     PlanningOutput,
     SkeletonOutput,
     DayDetailOutput,
     merge_skeleton_and_days,
 )
 from src.similarity.layer_rules import (
-    format_rules_for_prompt,
+    compute_achieved_similarity,
     compute_change_rules,
+    compute_retain_ratio,
     extract_reference_data,
+    format_rules_for_prompt,
+    select_preserved,
 )
 from src.validator.itinerary_validator import validate_itinerary, validate_skeleton
 from src.cache import get_cache
-from src.mcp_connection import get_mcp_client, prefixed
+from src.mcp_connection import create_mcp_client, get_mcp_client, prefixed
 
 logger = logging.getLogger(__name__)
 
@@ -571,193 +574,7 @@ class CollectContextNode(MultiAgentBase):
 
 
 # ---------------------------------------------------------------------------
-# Node 3: Generate Itinerary
-# ---------------------------------------------------------------------------
-class GenerateItineraryNode(MultiAgentBase):
-    """Invoke the Itinerary Agent (Opus) with context and rules to generate a PlanningOutput."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._agent = None  # lazy init
-
-    async def invoke_async(self, task, invocation_state=None, **kwargs):
-        start = time.time()
-        invocation_state = invocation_state or {}
-
-        if self._agent is None:
-            self._agent = create_itinerary_agent()
-
-        planning_input = invocation_state.get("planning_input_parsed", {})
-        graph_context = invocation_state.get("graph_context", {})
-        rules_prompt = invocation_state.get("similarity_rules_prompt", "")
-        correction_guide = invocation_state.get("correction_guide", "")
-        retry_count = invocation_state.get("retry_count", 0)
-
-        # Build the user message
-        parts = [
-            "## 기획 요청",
-            json.dumps(planning_input, ensure_ascii=False, default=str),
-            "",
-            rules_prompt,
-            "",
-            "## Graph 컨텍스트 (Knowledge Graph 조회 결과)",
-            json.dumps(graph_context, ensure_ascii=False, default=str),
-        ]
-
-        if correction_guide:
-            parts.extend([
-                "",
-                f"## 이전 검증 실패 (재시도 {retry_count}/3)",
-                correction_guide,
-                "",
-                "위 문제를 수정하여 다시 일정을 생성하세요.",
-            ])
-
-        user_message = "\n".join(parts)
-
-        # Invoke the itinerary agent
-        result = self._agent(user_message)
-        output: PlanningOutput = result.structured_output
-
-        # product_code and generated_at are server-generated on save (Lambda)
-
-        # Store output in state
-        invocation_state["planning_output"] = output.model_dump()
-        invocation_state["planning_output_obj"] = output
-
-        output_text = output.model_dump_json(ensure_ascii=False)
-
-        elapsed = time.time() - start
-        logger.info("GenerateItineraryNode completed in %.2fs", elapsed)
-
-        agent_result = _make_agent_result(output_text)
-        return MultiAgentResult(
-            status=Status.COMPLETED,
-            results={"generate_itinerary": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
-        )
-
-
-# ---------------------------------------------------------------------------
-# Node 4: Validate
-# ---------------------------------------------------------------------------
-class ValidateNode(MultiAgentBase):
-    """Run programmatic validation on the generated itinerary.
-
-    Sets state flags for the conditional edges:
-    - validation_passed: True/False
-    - needs_retry: True if failed and retries remain
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    @staticmethod
-    def _extract_planning_output_from_text(text: str) -> PlanningOutput | None:
-        """Try to extract a PlanningOutput JSON from node output text.
-
-        The task text passed by GraphBuilder contains formatted results from
-        upstream nodes. We look for a JSON object containing 'package_name'
-        which is a required field of PlanningOutput.
-        """
-        if not text:
-            return None
-        # Find JSON objects in the text by looking for balanced braces
-        # containing the key marker "package_name"
-        for match in re.finditer(r'\{', text):
-            start_idx = match.start()
-            # Quick check: does the rest contain our marker?
-            remainder = text[start_idx:]
-            if '"package_name"' not in remainder[:5000]:
-                continue
-            # Try increasingly large slices to find valid JSON
-            depth = 0
-            for i, ch in enumerate(remainder):
-                if ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        candidate = remainder[:i + 1]
-                        try:
-                            data = json.loads(candidate)
-                            if isinstance(data, dict) and "package_name" in data:
-                                logger.info("ValidateNode: successfully parsed PlanningOutput from task text")
-                                return PlanningOutput(**data)
-                        except (json.JSONDecodeError, Exception):
-                            pass
-                        break
-        return None
-
-    async def invoke_async(self, task, invocation_state=None, **kwargs):
-        start = time.time()
-        invocation_state = invocation_state or {}
-
-        # Try multiple sources for the PlanningOutput:
-        # 1. invocation_state (direct object)
-        # 2. invocation_state (serialized dict)
-        # 3. task text from previous node output (JSON fallback)
-        output_obj = invocation_state.get("planning_output_obj")
-
-        if output_obj is None:
-            output_data = invocation_state.get("planning_output")
-            if output_data and isinstance(output_data, dict) and len(output_data) > 0:
-                logger.info("ValidateNode: loading PlanningOutput from invocation_state dict")
-                output_obj = PlanningOutput(**output_data)
-
-        if output_obj is None:
-            # Fallback: parse from the task text (previous node's AgentResult text)
-            task_str = str(task) if task else ""
-            logger.info("ValidateNode: attempting to parse PlanningOutput from task text (%d chars)", len(task_str))
-            # The task text may contain structured node output with JSON
-            # Try to extract a JSON object that looks like PlanningOutput
-            parsed = self._extract_planning_output_from_text(task_str)
-            if parsed is not None:
-                output_obj = parsed
-            else:
-                raise RuntimeError(
-                    "ValidateNode: could not find PlanningOutput in invocation_state or task text"
-                )
-
-        validation = validate_itinerary(output_obj)
-        retry_count = invocation_state.get("retry_count", 0)
-
-        if validation.passed:
-            invocation_state["validation_passed"] = True
-            invocation_state["needs_retry"] = False
-            invocation_state["validation_result"] = validation.model_dump()
-            status_msg = f"PASS (score={validation.score})"
-        elif retry_count < 3:
-            invocation_state["validation_passed"] = False
-            invocation_state["needs_retry"] = True
-            invocation_state["retry_count"] = retry_count + 1
-            invocation_state["correction_guide"] = validation.correction_guide
-            invocation_state["validation_result"] = validation.model_dump()
-            status_msg = f"FAIL (score={validation.score}, retry {retry_count + 1}/3)"
-        else:
-            # Max retries reached -- pass with warnings
-            invocation_state["validation_passed"] = True
-            invocation_state["needs_retry"] = False
-            invocation_state["validation_result"] = validation.model_dump()
-            invocation_state["passed_with_warnings"] = True
-            status_msg = f"PASS_WITH_WARNINGS (score={validation.score}, max retries)"
-
-        elapsed = time.time() - start
-        logger.info("ValidateNode completed in %.2fs -- %s", elapsed, status_msg)
-
-        output_text = json.dumps({
-            "status": status_msg,
-            "validation": validation.model_dump(),
-        }, ensure_ascii=False, default=str)
-
-        agent_result = _make_agent_result(output_text)
-        return MultiAgentResult(
-            status=Status.COMPLETED,
-            results={"validate": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
-        )
-
-
-# ---------------------------------------------------------------------------
-# Node 5: Generate Skeleton (Phase 1 — Sonnet, fast)
+# Node 3: Generate Skeleton (Phase 1 — Sonnet, fast)
 # ---------------------------------------------------------------------------
 class GenerateSkeletonNode(MultiAgentBase):
     """Phase 1: Generate travel structure (cities, flights, hotels, pricing)."""
@@ -808,23 +625,42 @@ class GenerateSkeletonNode(MultiAgentBase):
         result = self._agent("\n".join(parts))
         skeleton: SkeletonOutput = result.structured_output
 
-        # ── 유사도 강제 후처리 ──────────────────────────────────────────────
-        # similarity 가 retain 으로 판정한 layer 의 값을 reference 와 일치시킨다.
-        # LLM 이 무시한 경우에도 코드 레벨에서 강제 일치시켜 입력 의도를 보장.
-        rules = compute_change_rules(similarity)
+        # ── 유사도 강제 후처리 (gradient) ───────────────────────────────────
+        # 각 layer 의 retain ratio 만큼 reference 항목을 보존하고, 나머지는
+        # LLM 출력의 신규 항목으로 채운다. 보존 슬롯은 코드 레벨에서 강제
+        # 삽입하여 사용자 입력 의도를 보장.
+        ratios = compute_retain_ratio(similarity)
+        rules = compute_change_rules(similarity)  # legacy 호환용 표시값
+
         if ref_data:
-            if rules.get("route") == "retain":
-                if ref_data.get("cities"):
-                    skeleton.city_list = list(ref_data["cities"])
-                    skeleton.travel_cities = "-".join(ref_data["cities"])
-            if rules.get("hotel") == "retain":
-                if ref_data.get("hotels"):
-                    skeleton.hotels = list(ref_data["hotels"])
-            # attractions/activities 는 day_detail 단계에서 처리
+            ref_cities = list(ref_data.get("cities") or [])
+            if ref_cities:
+                kept_cities = select_preserved(ref_cities, ratios["route"])
+                merged_cities: list[str] = list(kept_cities)
+                for c in skeleton.city_list or []:
+                    if c and c not in merged_cities:
+                        merged_cities.append(c)
+                # 도시 수는 reference 와 동일하게 유지(여행 일수 매칭)
+                target_n = len(ref_cities)
+                skeleton.city_list = merged_cities[:target_n]
+                if skeleton.city_list:
+                    skeleton.travel_cities = "-".join(skeleton.city_list)
+
+            ref_hotels = list(ref_data.get("hotels") or [])
+            if ref_hotels:
+                kept_hotels = select_preserved(ref_hotels, ratios["hotel"])
+                merged_hotels: list[str] = list(kept_hotels)
+                for h in skeleton.hotels or []:
+                    if h and h not in merged_hotels:
+                        merged_hotels.append(h)
+                target_n_h = len(ref_hotels)
+                skeleton.hotels = merged_hotels[:target_n_h]
+            # attractions 는 day_detail 단계에서 ratio 기반으로 보존 강제
 
         invocation_state["skeleton_output"] = skeleton.model_dump()
         invocation_state["skeleton_output_obj"] = skeleton
         invocation_state["similarity_rules"] = rules
+        invocation_state["similarity_ratios"] = ratios
         invocation_state["reference_retain_data"] = ref_data
 
         output_text = json.dumps(skeleton.model_dump(), ensure_ascii=False, default=str)
@@ -839,7 +675,7 @@ class GenerateSkeletonNode(MultiAgentBase):
 
 
 # ---------------------------------------------------------------------------
-# Node 6: Validate Skeleton
+# Node 4: Validate Skeleton
 # ---------------------------------------------------------------------------
 class ValidateSkeletonNode(MultiAgentBase):
     """Validate skeleton structure: day count, route logic, flight buffer."""
@@ -886,23 +722,13 @@ class ValidateSkeletonNode(MultiAgentBase):
 
 
 # ---------------------------------------------------------------------------
-# Node 7: Generate Day Details (Phase 2 — Opus, parallel per day)
+# Day Details helpers (shared by Prepare / SingleDay / Aggregate nodes)
 # ---------------------------------------------------------------------------
-class GenerateDayDetailsNode(MultiAgentBase):
-    """Phase 2: Fill in per-day attractions, meals, activities.
-
-    Days are generated in parallel via ``asyncio.gather`` with separate
-    Agent instances.  To prevent duplicate attractions across days in the
-    same city, attractions from graph_context are pre-partitioned and each
-    day receives only its assigned subset.  The existing
-    ``ValidateDayDetailsNode`` catches any remaining duplicates.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
+class _DayBudget:
+    """Encapsulates time-budget + attraction-partition logic for day workers."""
 
     @staticmethod
-    def _compute_time_budget(
+    def compute(
         day_num: int, total_days: int, skeleton, num_cities: int = 1
     ) -> dict:
         """Compute time budget for a day.
@@ -950,15 +776,8 @@ class GenerateDayDetailsNode(MultiAgentBase):
             "intercity_travel_h": round(intercity_travel_h, 1),
         }
 
-    # Backward-compat thin shim
     @staticmethod
-    def _compute_max_attractions(day_num: int, total_days: int, skeleton) -> int:
-        return GenerateDayDetailsNode._compute_time_budget(
-            day_num, total_days, skeleton, num_cities=1
-        )["max_attractions"]
-
-    @staticmethod
-    def _partition_attractions(sorted_allocs, graph_context: dict) -> dict[int, list[str]]:
+    def partition_attractions(sorted_allocs, graph_context: dict) -> dict[int, list[str]]:
         """Pre-assign attractions to each day to prevent cross-day duplicates.
 
         For days sharing the same city, attractions are round-robin split so
@@ -998,176 +817,465 @@ class GenerateDayDetailsNode(MultiAgentBase):
 
         return day_assigned
 
+
+def _build_day_prompt(
+    *,
+    day_alloc,
+    sorted_allocs,
+    skeleton: SkeletonOutput,
+    graph_context: dict,
+    rules_prompt: str,
+    day_attractions: dict[int, list[str]],
+    other_days_attractions: list[str],
+    must_include: list[str] | None = None,
+    correction: str = "",
+) -> str:
+    """Render the user prompt for a single day's detail agent.
+
+    ``must_include`` is the slice of reference attractions assigned to this
+    day under the gradient retain ratio; the agent is required to include
+    these names verbatim. Aggregate-time enforcement re-injects any that the
+    LLM dropped.
+    """
+    idx = next(i for i, a in enumerate(sorted_allocs) if a.day == day_alloc.day)
+
+    prev_last_city = ""
+    if idx > 0:
+        prev_cities = sorted_allocs[idx - 1].cities
+        prev_last_city = (
+            [c.strip() for c in prev_cities.split(",") if c.strip()][-1]
+            if prev_cities
+            else ""
+        )
+
+    next_first_city = ""
+    if idx < len(sorted_allocs) - 1:
+        next_cities = sorted_allocs[idx + 1].cities
+        next_first_city = (
+            [c.strip() for c in next_cities.split(",") if c.strip()][0]
+            if next_cities
+            else ""
+        )
+
+    day_city_list = [c.strip() for c in day_alloc.cities.split(",") if c.strip()]
+    budget = _DayBudget.compute(
+        day_alloc.day, skeleton.days, skeleton, num_cities=len(day_city_list)
+    )
+    max_attr = budget["max_attractions"]
+
+    parts = [
+        f"## {day_alloc.day}일차 상세 기획",
+        f"- 날짜: {day_alloc.date} ({day_alloc.day_of_week})",
+        f"- 도시: {day_alloc.cities}",
+        f"- 숙소: {skeleton.hotels[day_alloc.day - 1] if day_alloc.day <= len(skeleton.hotels) else '(귀국일)'}",
+        f"- 항공편: 출발편 도착 {skeleton.departure_flight.arrival_time} / 귀국편 출발 {skeleton.return_flight.departure_time}",
+        f"- 전체 일정: {skeleton.days}일 중 {day_alloc.day}일차",
+        f"- **시간 예산**: 가용 {budget['available_hours']}h "
+        f"(도시 {budget['num_cities']}개, 도시간 이동 -{budget['intercity_travel_h']}h, {budget['rationale']})",
+        f"- **관광지 상한: {max_attr}개** (절대 초과 금지)",
+        f"- 명소당 평균: 관광 1.5h + 이동 0.5h = 2h. stay_minutes 가 있으면 그 값을 사용.",
+    ]
+    if prev_last_city:
+        parts.append(f"- 전날 마지막 도시: {prev_last_city} → 오늘 첫 도시와 동일해야 함")
+    if next_first_city:
+        parts.append(f"- 다음날 첫 도시: {next_first_city} → 오늘 마지막 도시와 동일해야 함")
+
+    assigned = day_attractions.get(day_alloc.day, [])
+    parts.extend(
+        [
+            "",
+            rules_prompt,
+            "",
+            "## 이 일차에 배정된 추천 관광지",
+            ", ".join(assigned) if assigned else "(자유 선택)",
+            "",
+            "## 다른 일차 관광지 (중복 금지)",
+            ", ".join(set(other_days_attractions)) if other_days_attractions else "(없음)",
+        ]
+    )
+
+    if must_include:
+        parts.extend(
+            [
+                "",
+                "## 반드시 포함해야 할 reference 명소 (similarity 보존)",
+                ", ".join(must_include),
+                "위 명소는 이름까지 정확히 그대로 attractions 에 넣어주세요. 누락 시 검증 실패.",
+            ]
+        )
+
+    parts.extend(
+        [
+            "",
+            "## Graph 컨텍스트 (이 일차 도시 관련만)",
+            json.dumps(
+                _build_day_context(graph_context, day_city_list, day_alloc.day),
+                ensure_ascii=False,
+                default=str,
+            ),
+        ]
+    )
+    if correction:
+        parts.extend(["", "## 이전 검증 실패", correction, "위 문제를 수정하세요."])
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Node 5a: Prepare Day Prompts (coordinator before fan-out)
+# ---------------------------------------------------------------------------
+class PrepareDayPromptsNode(MultiAgentBase):
+    """Build per-day prompts and persist them in invocation_state.
+
+    Splitting prompt construction off from generation lets each day worker
+    be a pure leaf in the graph (one agent call → one structured output).
+    Prompts for already-passed days are skipped on retry.
+    """
+
     async def invoke_async(self, task, invocation_state=None, **kwargs):
         start = time.time()
         invocation_state = invocation_state or {}
 
         skeleton_data = invocation_state.get("skeleton_output")
-        skeleton = SkeletonOutput(**skeleton_data) if skeleton_data else invocation_state.get("skeleton_output_obj")
+        if skeleton_data:
+            skeleton = SkeletonOutput(**skeleton_data)
+        else:
+            skeleton = invocation_state.get("skeleton_output_obj")
+        if skeleton is None:
+            raise RuntimeError("PrepareDayPromptsNode: no skeleton in invocation_state")
+
         graph_context = invocation_state.get("graph_context", {})
-        rules_prompt = invocation_state.get("similarity_rules_prompt", "")
         failed_days = invocation_state.get("failed_days", [])
+
+        # Rebuild rules_prompt with concrete reference values so the gradient
+        # ratio + preserved item lists are visible to each day worker.
+        planning_input_dict = invocation_state.get("planning_input_parsed", {})
+        similarity_level = int(planning_input_dict.get("similarity_level", 50))
+        ref_data_for_prompt = invocation_state.get("reference_retain_data") or {}
+        rules_prompt = format_rules_for_prompt(
+            similarity_level, reference_data=ref_data_for_prompt
+        )
+        invocation_state["similarity_rules_prompt"] = rules_prompt
 
         existing_details = invocation_state.get("day_details_list", [])
         existing_by_day = {d["day"]: d for d in existing_details}
 
         sorted_allocs = sorted(skeleton.day_allocations, key=lambda d: d.day)
+        day_attractions = _DayBudget.partition_attractions(sorted_allocs, graph_context)
 
-        # Pre-partition attractions to eliminate sequential dependency
-        day_attractions = self._partition_attractions(sorted_allocs, graph_context)
-
-        # Collect already-confirmed attractions from existing (passed) days
         existing_attractions: list[str] = []
         for alloc in sorted_allocs:
-            if failed_days and alloc.day not in failed_days and alloc.day in existing_by_day:
-                existing = DayDetailOutput(**existing_by_day[alloc.day])
-                existing_attractions.extend(existing.attractions)
+            if (
+                failed_days
+                and alloc.day not in failed_days
+                and alloc.day in existing_by_day
+            ):
+                existing_attractions.extend(
+                    DayDetailOutput(**existing_by_day[alloc.day]).attractions
+                )
 
-        # Build prompts and identify days that need generation
-        generation_tasks: list[tuple[int, str]] = []  # (day_num, prompt)
+        # Gradient retain: pick the first round(N×ratio) reference attractions
+        # and assign each to a day whose cities actually contain it. Without
+        # this guard, must-include names get round-robin'd onto days that
+        # can't host them, which makes the city-scope validator fail every
+        # retry. Names with no resolvable city or no matching day fall back
+        # to plain round-robin so they're still surfaced somewhere.
+        ratios = invocation_state.get("similarity_ratios") or {}
+        ref_data = invocation_state.get("reference_retain_data") or {}
+        ref_attrs = list(ref_data.get("attractions") or [])
+        attr_city_map: dict[str, str] = dict(
+            ref_data.get("attraction_cities") or {}
+        )
+        attraction_ratio = float(ratios.get("attraction", 0.0)) if ratios else 0.0
+        preserved_attrs = select_preserved(ref_attrs, attraction_ratio)
 
-        for idx, day_alloc in enumerate(sorted_allocs):
-            if failed_days and day_alloc.day not in failed_days and day_alloc.day in existing_by_day:
+        # day → set of cities that day visits (used to gate placement)
+        day_to_cities: dict[int, set[str]] = {}
+        for alloc in sorted_allocs:
+            day_to_cities[alloc.day] = {
+                c.strip() for c in (alloc.cities or "").split(",") if c.strip()
+            }
+
+        must_include_by_day: dict[int, list[str]] = {a.day: [] for a in sorted_allocs}
+        unplaced: list[str] = []
+        for name in preserved_attrs:
+            city = attr_city_map.get(name, "")
+            placed = False
+            if city:
+                # Days whose cities contain this attraction's city, ordered
+                # by current load so we balance across them.
+                candidates = [
+                    d for d, cs in day_to_cities.items() if city in cs
+                ]
+                if candidates:
+                    candidates.sort(key=lambda d: len(must_include_by_day[d]))
+                    must_include_by_day[candidates[0]].append(name)
+                    placed = True
+            if not placed:
+                unplaced.append(name)
+
+        # Fallback for attractions we couldn't city-match: round-robin
+        # across the lightest-loaded days so they still appear somewhere.
+        if unplaced:
+            day_order = [a.day for a in sorted_allocs]
+            for name in unplaced:
+                day_order.sort(key=lambda d: len(must_include_by_day[d]))
+                must_include_by_day[day_order[0]].append(name)
+
+        invocation_state["must_include_attractions"] = list(preserved_attrs)
+        invocation_state["must_include_by_day"] = {
+            str(k): v for k, v in must_include_by_day.items()
+        }
+
+        prompts: dict[int, str] = {}
+        days_to_generate: list[int] = []
+        for day_alloc in sorted_allocs:
+            if (
+                failed_days
+                and day_alloc.day not in failed_days
+                and day_alloc.day in existing_by_day
+            ):
                 continue
-
-            prev_last_city = ""
-            if idx > 0:
-                prev_cities = sorted_allocs[idx - 1].cities
-                prev_last_city = [c.strip() for c in prev_cities.split(",") if c.strip()][-1] if prev_cities else ""
-
-            next_first_city = ""
-            if idx < len(sorted_allocs) - 1:
-                next_cities = sorted_allocs[idx + 1].cities
-                next_first_city = [c.strip() for c in next_cities.split(",") if c.strip()][0] if next_cities else ""
-
-            day_city_list = [
-                c.strip() for c in day_alloc.cities.split(",") if c.strip()
-            ]
-            budget = self._compute_time_budget(
-                day_alloc.day, skeleton.days, skeleton, num_cities=len(day_city_list)
-            )
-            max_attr = budget["max_attractions"]
-
-            parts = [
-                f"## {day_alloc.day}일차 상세 기획",
-                f"- 날짜: {day_alloc.date} ({day_alloc.day_of_week})",
-                f"- 도시: {day_alloc.cities}",
-                f"- 숙소: {skeleton.hotels[day_alloc.day - 1] if day_alloc.day <= len(skeleton.hotels) else '(귀국일)'}",
-                f"- 항공편: 출발편 도착 {skeleton.departure_flight.arrival_time} / 귀국편 출발 {skeleton.return_flight.departure_time}",
-                f"- 전체 일정: {skeleton.days}일 중 {day_alloc.day}일차",
-                f"- **시간 예산**: 가용 {budget['available_hours']}h "
-                f"(도시 {budget['num_cities']}개, 도시간 이동 -{budget['intercity_travel_h']}h, {budget['rationale']})",
-                f"- **관광지 상한: {max_attr}개** (절대 초과 금지)",
-                f"- 명소당 평균: 관광 1.5h + 이동 0.5h = 2h. stay_minutes 가 있으면 그 값을 사용.",
-            ]
-
-            if prev_last_city:
-                parts.append(f"- 전날 마지막 도시: {prev_last_city} → 오늘 첫 도시와 동일해야 함")
-            if next_first_city:
-                parts.append(f"- 다음날 첫 도시: {next_first_city} → 오늘 마지막 도시와 동일해야 함")
-
-            # Assigned attractions for this day (pre-partitioned to avoid duplicates)
-            assigned = day_attractions.get(day_alloc.day, [])
-            # Other days' attractions to avoid
-            other_days_attractions = existing_attractions.copy()
+            other_attrs = existing_attractions.copy()
             for other_day, other_list in day_attractions.items():
                 if other_day != day_alloc.day:
-                    other_days_attractions.extend(other_list)
-
-            parts.extend([
-                "",
-                rules_prompt,
-                "",
-                "## 이 일차에 배정된 추천 관광지",
-                ", ".join(assigned) if assigned else "(자유 선택)",
-                "",
-                "## 다른 일차 관광지 (중복 금지)",
-                ", ".join(set(other_days_attractions)) if other_days_attractions else "(없음)",
-                "",
-                "## Graph 컨텍스트 (이 일차 도시 관련만)",
-                json.dumps(_build_day_context(graph_context, [c.strip() for c in day_alloc.cities.split(",") if c.strip()], day_alloc.day), ensure_ascii=False, default=str),
-            ])
-
-            correction = invocation_state.get(f"day_{day_alloc.day}_correction", "")
-            if correction:
-                parts.extend(["", "## 이전 검증 실패", correction, "위 문제를 수정하세요."])
-
-            generation_tasks.append((day_alloc.day, "\n".join(parts)))
-
-        # --- Parallel generation with separate Agent instances ---
-        async def _generate_day(day_num: int, prompt: str) -> DayDetailOutput:
-            agent = create_day_detail_agent()
-            result = await asyncio.to_thread(agent, prompt)
-            detail: DayDetailOutput = result.structured_output
-            for alloc in sorted_allocs:
-                if alloc.day == day_num:
-                    detail.day = alloc.day
-                    detail.date = alloc.date
-                    detail.day_of_week = alloc.day_of_week
-                    detail.cities = alloc.cities
-                    break
-            logger.info("Day %d detail generated", day_num)
-            return detail
-
-        generated: dict[int, DayDetailOutput] = {}
-        if generation_tasks:
-            logger.info("Generating %d day details in parallel...", len(generation_tasks))
-            results = await asyncio.gather(
-                *[_generate_day(dn, p) for dn, p in generation_tasks],
-                return_exceptions=True,
+                    other_attrs.extend(other_list)
+            prompts[day_alloc.day] = _build_day_prompt(
+                day_alloc=day_alloc,
+                sorted_allocs=sorted_allocs,
+                skeleton=skeleton,
+                graph_context=graph_context,
+                rules_prompt=rules_prompt,
+                day_attractions=day_attractions,
+                other_days_attractions=other_attrs,
+                must_include=must_include_by_day.get(day_alloc.day, []),
+                correction=invocation_state.get(f"day_{day_alloc.day}_correction", ""),
             )
-            for (day_num, _), result in zip(generation_tasks, results):
-                if isinstance(result, Exception):
-                    logger.error("Day %d generation failed: %s", day_num, result)
-                    raise result
-                generated[day_num] = result
+            days_to_generate.append(day_alloc.day)
 
-        # Merge: existing (passed) days + newly generated days, sorted by day
-        day_details = []
+        invocation_state["day_prompts"] = prompts
+        invocation_state["day_allocs_serialized"] = [a.model_dump() for a in sorted_allocs]
+        invocation_state["days_to_generate"] = days_to_generate
+
+        output_text = json.dumps(
+            {"days_to_generate": days_to_generate}, ensure_ascii=False
+        )
+        elapsed = time.time() - start
+        logger.info(
+            "PrepareDayPromptsNode completed in %.2fs (days=%s)",
+            elapsed,
+            days_to_generate,
+        )
+        return MultiAgentResult(
+            status=Status.COMPLETED,
+            results={
+                "prepare_day_prompts": NodeResult(
+                    result=_make_agent_result(output_text),
+                    status=Status.COMPLETED,
+                    execution_time=int(elapsed * 1000),
+                )
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Node 5b: Generate Single Day (one parallel worker per day)
+# ---------------------------------------------------------------------------
+class GenerateSingleDayNode(MultiAgentBase):
+    """One parallel branch in the graph — generates a single day's detail.
+
+    Each instance owns its own ``MCPClient`` for the duration of the call so
+    that workers don't serialize on the shared client's single background
+    event loop.  No-ops if ``failed_days`` is set and this day isn't in it
+    (so the same fan-out topology can be reused for retry).
+    """
+
+    def __init__(self, day_num: int) -> None:
+        super().__init__()
+        self.day_num = day_num
+
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        start = time.time()
+        invocation_state = invocation_state or {}
+        node_key = f"generate_day_{self.day_num}"
+
+        prompts: dict[int, str] = invocation_state.get("day_prompts", {})
+        prompt = prompts.get(self.day_num)
+
+        # No work needed: this day already passed validation on a prior loop.
+        if prompt is None:
+            elapsed = time.time() - start
+            logger.info(
+                "GenerateSingleDayNode[day=%d]: skipped (no prompt)", self.day_num
+            )
+            return MultiAgentResult(
+                status=Status.COMPLETED,
+                results={
+                    node_key: NodeResult(
+                        result=_make_agent_result(json.dumps({"skipped": True})),
+                        status=Status.COMPLETED,
+                        execution_time=int(elapsed * 1000),
+                    )
+                },
+            )
+
+        # Lookup matching day allocation for post-fill
+        allocs_raw = invocation_state.get("day_allocs_serialized", [])
+        from src.models.output import SkeletonDayAllocation
+        sorted_allocs = [SkeletonDayAllocation(**a) for a in allocs_raw]
+
+        # Each worker holds its own MCP client (own bg thread + asyncio loop
+        # + streamable HTTP session) so that Gateway calls run concurrently.
+        mcp = await asyncio.to_thread(create_mcp_client)
+        try:
+            agent = await asyncio.to_thread(create_day_detail_agent, mcp)
+            result = await asyncio.to_thread(agent, prompt)
+        finally:
+            try:
+                await asyncio.to_thread(mcp.stop, None, None, None)
+            except Exception as stop_err:
+                logger.warning(
+                    "MCPClient stop failed for day=%d: %s", self.day_num, stop_err
+                )
+
+        detail: DayDetailOutput = result.structured_output
         for alloc in sorted_allocs:
-            if alloc.day in generated:
-                day_details.append(generated[alloc.day])
+            if alloc.day == self.day_num:
+                detail.day = alloc.day
+                detail.date = alloc.date
+                detail.day_of_week = alloc.day_of_week
+                detail.cities = alloc.cities
+                break
+
+        # Stash into invocation_state under a per-day key so the aggregator
+        # can pick it up regardless of execution ordering or retry batches.
+        day_results = invocation_state.setdefault("day_results", {})
+        day_results[self.day_num] = detail.model_dump()
+
+        elapsed = time.time() - start
+        logger.info(
+            "GenerateSingleDayNode[day=%d] completed in %.2fs",
+            self.day_num,
+            elapsed,
+        )
+        return MultiAgentResult(
+            status=Status.COMPLETED,
+            results={
+                node_key: NodeResult(
+                    result=_make_agent_result(
+                        json.dumps({"day": self.day_num}, ensure_ascii=False)
+                    ),
+                    status=Status.COMPLETED,
+                    execution_time=int(elapsed * 1000),
+                )
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Node 5c: Aggregate Days (fan-in)
+# ---------------------------------------------------------------------------
+class AggregateDaysNode(MultiAgentBase):
+    """Merge per-day outputs into final PlanningOutput + similarity post-processing."""
+
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        start = time.time()
+        invocation_state = invocation_state or {}
+
+        skeleton_data = invocation_state.get("skeleton_output")
+        if skeleton_data:
+            skeleton = SkeletonOutput(**skeleton_data)
+        else:
+            skeleton = invocation_state.get("skeleton_output_obj")
+        if skeleton is None:
+            raise RuntimeError("AggregateDaysNode: no skeleton in invocation_state")
+
+        sorted_allocs = sorted(skeleton.day_allocations, key=lambda d: d.day)
+
+        # day_results is the live store updated by parallel workers; for
+        # days that already passed earlier, fall back to day_details_list.
+        live_by_day: dict = invocation_state.get("day_results", {})
+        existing_by_day = {
+            d["day"]: d for d in invocation_state.get("day_details_list", [])
+        }
+
+        day_details: list[DayDetailOutput] = []
+        for alloc in sorted_allocs:
+            if alloc.day in live_by_day:
+                day_details.append(DayDetailOutput(**live_by_day[alloc.day]))
             elif alloc.day in existing_by_day:
                 day_details.append(DayDetailOutput(**existing_by_day[alloc.day]))
 
-        # ── 유사도 강제: attraction(L3) retain 시 reference 명소 보장 ─────
+        # ── Similarity gradient enforcement (L3 attraction)
+        # Re-insert any preserved reference attractions that the LLM dropped.
+        # The day_to_must mapping was decided at PrepareDayPromptsNode based
+        # on the gradient retain ratio, so we put each missing name back on
+        # the day it was originally assigned to (falls back to last day).
         ref_data = invocation_state.get("reference_retain_data") or {}
-        rules = invocation_state.get("similarity_rules") or {}
-        if rules.get("attraction") == "retain" and ref_data.get("attractions"):
-            ref_attrs = list(ref_data["attractions"])
-            existing_names: set[str] = set()
-            for d in day_details:
-                for n in d.attractions:
-                    existing_names.add(n)
-            missing = [n for n in ref_attrs if n not in existing_names]
-            # 누락된 reference 명소를 마지막 day 의 attractions 끝에 보강한다.
-            if missing and day_details:
-                target = day_details[-1]
-                for n in missing:
-                    if n not in target.attractions:
-                        target.attractions.append(n)
+        must_by_day_raw = invocation_state.get("must_include_by_day") or {}
+        must_by_day: dict[int, list[str]] = {}
+        for k, v in must_by_day_raw.items():
+            try:
+                must_by_day[int(k)] = list(v) if isinstance(v, list) else []
+            except (TypeError, ValueError):
+                continue
+
+        if must_by_day and day_details:
+            day_index = {d.day: d for d in day_details}
+            attr_city_map = dict((ref_data.get("attraction_cities") or {}))
+            inserted = 0
+            for day_num, names in must_by_day.items():
+                target = day_index.get(day_num) or day_details[-1]
+                target_cities = {
+                    c.strip()
+                    for c in (target.cities or "").split(",")
+                    if c.strip()
+                }
+                existing_names = set(target.attractions)
+                for name in names:
+                    if not name or name in existing_names:
+                        continue
+                    # Only append if the attraction's city actually matches
+                    # this day. Otherwise dropping it is preferable to
+                    # injecting a city-scope violation that retries can't
+                    # resolve. The achieved_similarity calc later still
+                    # reflects the real outcome.
+                    city = attr_city_map.get(name, "")
+                    if city and target_cities and city not in target_cities:
+                        continue
+                    target.attractions.append(name)
+                    existing_names.add(name)
+                    inserted += 1
+            if inserted:
                 logger.info(
-                    "Retain L3 attraction: appended %d missing reference attractions",
-                    len(missing),
+                    "Similarity gradient: appended %d missing preserved attractions",
+                    inserted,
                 )
 
-        final_output = merge_skeleton_and_days(skeleton, day_details)
-
-        # ── similarity_score 보정: 사용자 요청값으로 강제 동기화 ─────────
-        # LLM 이 PlanningOutput.similarity_score 를 임의로 채울 수 있으므로
-        # 사용자가 슬라이더에 입력한 similarity_level 로 덮어쓴다.
         planning_input_dict = invocation_state.get("planning_input_parsed", {})
+        final_output = merge_skeleton_and_days(
+            skeleton, day_details, planning_input=planning_input_dict
+        )
+
+        # similarity_score: force-sync to user-requested value
         target_similarity = int(planning_input_dict.get("similarity_level", 50))
         final_output.similarity_score = target_similarity
+
+        # ── A3: actual achieved similarity (Jaccard vs reference)
+        try:
+            achieved = compute_achieved_similarity(final_output, ref_data)
+            final_output.achieved_similarity = achieved["achieved"]
+            final_output.similarity_breakdown = achieved["breakdown"]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("achieved similarity calc failed: %s", e)
         if final_output.changes_summary is not None:
             final_output.changes_summary.similarity_applied = target_similarity
+            rules_legacy = invocation_state.get("similarity_rules") or {}
             modified_layers = [
-                layer for layer, decision in (rules or {}).items() if decision == "modify"
+                layer for layer, decision in rules_legacy.items() if decision == "modify"
             ]
             if modified_layers:
                 final_output.changes_summary.layers_modified = modified_layers
 
-        # ── graph_trace 주입 ────────────────────────────────────────────
         graph_trace = invocation_state.get("graph_trace") or []
         if graph_trace:
             final_output.graph_trace = list(graph_trace)
@@ -1176,19 +1284,207 @@ class GenerateDayDetailsNode(MultiAgentBase):
         invocation_state["planning_output_obj"] = final_output
         invocation_state["day_details_list"] = [d.model_dump() for d in day_details]
 
-        output_text = json.dumps({"days_generated": len(generation_tasks)}, ensure_ascii=False)
         elapsed = time.time() - start
-        logger.info("GenerateDayDetailsNode completed in %.2fs (%d days, parallel)", elapsed, len(generation_tasks))
-
-        agent_result = _make_agent_result(output_text)
+        logger.info(
+            "AggregateDaysNode completed in %.2fs (%d days)",
+            elapsed,
+            len(day_details),
+        )
+        output_text = json.dumps(
+            {"aggregated_days": len(day_details)}, ensure_ascii=False
+        )
         return MultiAgentResult(
             status=Status.COMPLETED,
-            results={"generate_day_details": NodeResult(result=agent_result, status=Status.COMPLETED, execution_time=int(elapsed * 1000))},
+            results={
+                "aggregate_days": NodeResult(
+                    result=_make_agent_result(output_text),
+                    status=Status.COMPLETED,
+                    execution_time=int(elapsed * 1000),
+                )
+            },
         )
 
 
 # ---------------------------------------------------------------------------
-# Node 8: Validate Day Details (per-day + cross-day)
+# Node 5d: Synthesize (post-aggregate copywriting)
+# ---------------------------------------------------------------------------
+class SynthesizeNode(MultiAgentBase):
+    """LLM copywriter that runs after :class:`AggregateDaysNode`.
+
+    Receives the merged ``PlanningOutput`` (cities, hotels, flights,
+    full itinerary) plus user intent and reference data, and rewrites:
+    package_name, description, hashtags, highlights, changes_summary.
+
+    The agent is forbidden from changing any factual content
+    (cities/hotels/itinerary) — those are already validated grounded
+    decisions from the upstream graph. Failures fall back to the
+    placeholder values written by ``merge_skeleton_and_days``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._agent = None  # lazy
+
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        start = time.time()
+        invocation_state = invocation_state or {}
+
+        output_data = invocation_state.get("planning_output")
+        if not isinstance(output_data, dict):
+            logger.warning(
+                "SynthesizeNode: no planning_output found, skipping copy rewrite"
+            )
+            return self._completed_result(start, "no_output")
+
+        try:
+            output_obj = PlanningOutput(**output_data)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("SynthesizeNode: PlanningOutput parse failed: %s", e)
+            return self._completed_result(start, "parse_error")
+
+        prompt = self._build_prompt(output_obj, invocation_state)
+
+        try:
+            if self._agent is None:
+                from src.agents.synthesize import create_synthesize_agent
+                self._agent = create_synthesize_agent()
+            result = await asyncio.to_thread(self._agent, prompt)
+            synth = result.structured_output
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "SynthesizeNode: LLM call failed (%s) — keeping placeholders", e
+            )
+            return self._completed_result(start, "llm_error")
+
+        # Splat LLM-written fields onto the merged output.
+        if getattr(synth, "package_name", None):
+            output_obj.package_name = synth.package_name
+        output_obj.description = getattr(synth, "description", "") or output_obj.description
+        if getattr(synth, "hashtags", None):
+            output_obj.hashtags = list(synth.hashtags)
+        if getattr(synth, "highlights", None):
+            output_obj.highlights = list(synth.highlights)[:10]
+        # Stage 4: pricing / inclusions / exclusions / optional_costs are
+        # day-aware judgment fields. Take what the LLM wrote whenever it
+        # produced something non-empty; otherwise the placeholder from
+        # merge_skeleton_and_days (Pricing(), []) stays.
+        synth_pricing = getattr(synth, "pricing", None)
+        if synth_pricing is not None and getattr(synth_pricing, "adult_price", 0):
+            output_obj.pricing = synth_pricing
+        if getattr(synth, "inclusions", None):
+            output_obj.inclusions = list(synth.inclusions)
+        if getattr(synth, "exclusions", None):
+            output_obj.exclusions = list(synth.exclusions)
+        if getattr(synth, "optional_costs", None):
+            output_obj.optional_costs = list(synth.optional_costs)
+
+        # changes_summary: keep code-derived trend_added & similarity_applied,
+        # accept LLM's retained / modified / layers_modified narrative.
+        if getattr(synth, "changes_summary", None) is not None:
+            cs = synth.changes_summary
+            existing = output_obj.changes_summary
+            output_obj.changes_summary = ChangesSummary(
+                retained=list(cs.retained or existing.retained),
+                modified=list(cs.modified or existing.modified),
+                trend_added=list(existing.trend_added),  # code-authoritative
+                similarity_applied=existing.similarity_applied,  # code-authoritative
+                layers_modified=list(cs.layers_modified or existing.layers_modified),
+            )
+
+        invocation_state["planning_output"] = output_obj.model_dump()
+        invocation_state["planning_output_obj"] = output_obj
+
+        return self._completed_result(start, "ok")
+
+    @staticmethod
+    def _build_prompt(output: "PlanningOutput", invocation_state: dict) -> str:
+        """Render a compact synth prompt — itinerary + intent + reference."""
+        planning_input = invocation_state.get("planning_input_parsed", {}) or {}
+        ref_data = invocation_state.get("reference_retain_data", {}) or {}
+        achieved_breakdown = output.similarity_breakdown or {}
+
+        skeleton_summary = {
+            "cities": output.city_list,
+            "hotels": output.hotels,
+            "departure": {
+                "airline": output.airline,
+                "flight": output.departure_flight.flight_number,
+                "arrival_time": output.departure_flight.arrival_time,
+            },
+            "return": {
+                "flight": output.return_flight.flight_number,
+                "departure_time": output.return_flight.departure_time,
+            },
+            "brand": output.brand,
+        }
+        itinerary_summary = [
+            {
+                "day": d.day,
+                "date": d.date,
+                "cities": d.cities,
+                "attractions": d.attractions,
+            }
+            for d in output.itinerary
+        ]
+        intent = {
+            "themes": planning_input.get("themes") or [],
+            "season": planning_input.get("departure_season"),
+            "similarity_level": planning_input.get("similarity_level"),
+            "natural_language_request": planning_input.get(
+                "natural_language_request", ""
+            ),
+            "target_customer": planning_input.get("target_customer", ""),
+        }
+        ref_summary = {
+            "cities": ref_data.get("cities") or [],
+            "hotels": ref_data.get("hotels") or [],
+            "attractions": ref_data.get("attractions") or [],
+        }
+
+        parts = [
+            "## skeleton",
+            json.dumps(skeleton_summary, ensure_ascii=False, default=str),
+            "",
+            "## itinerary (확정)",
+            json.dumps(itinerary_summary, ensure_ascii=False, default=str),
+            "",
+            "## planning_input (사용자 의도)",
+            json.dumps(intent, ensure_ascii=False, default=str),
+            "",
+            "## reference_summary (비교 대상)",
+            json.dumps(ref_summary, ensure_ascii=False, default=str),
+            "",
+            "## achieved_similarity (코드 측정값)",
+            json.dumps(
+                {
+                    "score": output.achieved_similarity,
+                    "breakdown": achieved_breakdown,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        ]
+        return "\n".join(parts)
+
+    def _completed_result(self, start: float, mode: str) -> MultiAgentResult:
+        elapsed = time.time() - start
+        logger.info("SynthesizeNode completed in %.2fs (%s)", elapsed, mode)
+        return MultiAgentResult(
+            status=Status.COMPLETED,
+            results={
+                "synthesize": NodeResult(
+                    result=_make_agent_result(
+                        json.dumps({"mode": mode}, ensure_ascii=False)
+                    ),
+                    status=Status.COMPLETED,
+                    execution_time=int(elapsed * 1000),
+                )
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Node 6: Validate Day Details (per-day + cross-day)
 # ---------------------------------------------------------------------------
 class ValidateDayDetailsNode(MultiAgentBase):
     """Validate merged PlanningOutput: per-day + cross-day checks."""
@@ -1206,6 +1502,55 @@ class ValidateDayDetailsNode(MultiAgentBase):
                 raise RuntimeError("ValidateDayDetailsNode: no PlanningOutput found")
 
         validation = validate_itinerary(output_obj)
+
+        # Graph-grounded city-scope check via MCP (Lambda → Neptune).
+        # Direct boto3 calls from the agent runtime would block until
+        # Neptune connect timeout (~5min) since Runtime is on PUBLIC
+        # network and Neptune lives in VPC.
+        try:
+            day_attrs = {
+                str(d.day): list(d.attractions or []) for d in output_obj.itinerary
+            }
+            day_cities = {
+                str(d.day): [c.strip() for c in (d.cities or "").split(",") if c.strip()]
+                for d in output_obj.itinerary
+            }
+            mcp = get_mcp_client()
+            scope_result = await asyncio.to_thread(
+                mcp.call_tool_sync,
+                tool_use_id="validate-city-scope-1",
+                name=prefixed("validate_city_scope"),
+                arguments={"day_attractions": day_attrs, "day_cities": day_cities},
+            )
+            scope_payload = None
+            if hasattr(scope_result, "content") and scope_result.content:
+                for block in scope_result.content:
+                    if hasattr(block, "text"):
+                        try:
+                            scope_payload = json.loads(block.text)
+                            break
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+            if scope_payload:
+                from src.validator.itinerary_validator import (
+                    issues_from_city_scope_response,
+                )
+                extra_issues = issues_from_city_scope_response(output_obj, scope_payload)
+                if extra_issues:
+                    validation.issues.extend(extra_issues)
+                    error_count = sum(
+                        1 for i in validation.issues if i.severity.value == "ERROR"
+                    )
+                    warning_count = sum(
+                        1 for i in validation.issues if i.severity.value == "WARNING"
+                    )
+                    validation.score = max(
+                        0, 100 - (error_count * 15) - (warning_count * 5)
+                    )
+                    validation.passed = validation.score >= 70
+        except Exception as scope_err:
+            logger.warning("city_scope MCP validation skipped: %s", scope_err)
+
         retry_count = invocation_state.get("day_retry_count", 0)
 
         if validation.passed:

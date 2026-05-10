@@ -169,6 +169,10 @@ export interface PlanningOutput {
 
   // Agent meta fields
   similarity_score: number;
+  /** Layer-weighted Jaccard between this output and the reference (0..100). */
+  achieved_similarity?: number;
+  /** Per-layer Jaccard percentages (route/hotel/attraction). */
+  similarity_breakdown?: { route?: number; hotel?: number; attraction?: number };
   reference_products: string[];
   changes_summary: ChangesSummary;
   /** Knowledge Graph 도구 호출 트레이스 */

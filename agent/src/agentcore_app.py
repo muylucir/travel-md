@@ -26,16 +26,16 @@ logging.basicConfig(level=logging.INFO)
 app = BedrockAgentCoreApp()
 
 # Lazy singletons
-_graph = None
+_skeleton_graph = None
 _conversational_agent = None
 
 
-def _get_graph():
-    global _graph
-    if _graph is None:
+def _get_skeleton_graph():
+    global _skeleton_graph
+    if _skeleton_graph is None:
         from src.orchestrator.graph import create_planning_graph
-        _graph = create_planning_graph()
-    return _graph
+        _skeleton_graph = create_planning_graph()
+    return _skeleton_graph
 
 
 def _get_conversational_agent():
@@ -169,7 +169,57 @@ async def _handle_chat(payload):
 
 
 # ---------------------------------------------------------------------------
-# Planning mode — existing DAG pipeline (form mode + chat trigger)
+# Graph runner helpers
+# ---------------------------------------------------------------------------
+async def _stream_keepalive(graph, task_input, invocation_state, *, base_pct, cap_pct):
+    """Run a graph and yield progress percentages while it executes.
+
+    Heartbeats every 10s prevent the SSE connection from idling out.  Pct
+    grows linearly from base_pct toward cap_pct so the user sees motion.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _runner():
+        try:
+            await graph.invoke_async(task_input, invocation_state)
+            await queue.put(("done", None))
+        except Exception as exc:
+            await queue.put(("error", exc))
+
+    async def _heartbeat():
+        tick = 0
+        while True:
+            await asyncio.sleep(10)
+            tick += 1
+            pct = min(base_pct + tick * 5, cap_pct)
+            await queue.put(("tick", pct))
+
+    runner = asyncio.create_task(_runner())
+    beat = asyncio.create_task(_heartbeat())
+    try:
+        while True:
+            kind, payload = await queue.get()
+            if kind == "done":
+                return
+            if kind == "error":
+                raise payload
+            if kind == "tick":
+                yield payload
+    finally:
+        beat.cancel()
+        try:
+            await beat
+        except asyncio.CancelledError:
+            pass
+        if not runner.done():
+            try:
+                await runner
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Planning mode — two-stage DAG pipeline (form mode + chat trigger)
 # ---------------------------------------------------------------------------
 async def _handle_planning(payload):
     """Run the existing DAG planning pipeline. Used by both form mode and chat trigger."""
@@ -204,100 +254,58 @@ async def _handle_planning(payload):
 
         yield {"event": "progress", "data": {"step": "컨텍스트 수집 중...", "percent": 15}}
 
-        graph = _get_graph()
+        # ── Stage 1: skeleton graph (parse → collect → skeleton ↔ validate)
+        skeleton_graph = _get_skeleton_graph()
 
-        yield {"event": "progress", "data": {"step": "일정 생성 중...", "percent": 30}}
+        yield {"event": "progress", "data": {"step": "골격 생성 중...", "percent": 25}}
 
-        # Run DAG with keepalive to prevent connection timeout.
-        # The graph can take 60-120s (Opus generation + retries).
-        # We send progress heartbeats every 10s to keep SSE alive.
-        event_queue: asyncio.Queue = asyncio.Queue()
+        async for pct in _stream_keepalive(
+            skeleton_graph,
+            json.dumps(planning_input.model_dump(), ensure_ascii=False),
+            invocation_state,
+            base_pct=25,
+            cap_pct=45,
+        ):
+            yield {"event": "progress", "data": {"step": "골격 생성 중...", "percent": pct}}
 
-        async def _run_graph():
-            try:
-                r = await graph.invoke_async(
-                    json.dumps(planning_input.model_dump(), ensure_ascii=False),
-                    invocation_state,
-                )
-                await event_queue.put(("done", r))
-            except Exception as exc:
-                await event_queue.put(("error", exc))
+        # ── Stage 2: per-request day-details graph with N parallel workers
+        from src.models.output import PlanningOutput, SkeletonOutput
+        skeleton_data = invocation_state.get("skeleton_output")
+        if not skeleton_data:
+            raise RuntimeError("Skeleton stage produced no skeleton_output")
+        skeleton = SkeletonOutput(**skeleton_data)
+        day_count = skeleton.days
 
-        async def _keepalive():
-            tick = 0
-            while True:
-                await asyncio.sleep(10)
-                tick += 1
-                pct = min(30 + tick * 5, 75)  # 35, 40, 45, ... 75
-                await event_queue.put(("keepalive", pct))
+        from src.orchestrator.graph import create_day_details_graph
+        day_graph = create_day_details_graph(day_count)
 
-        graph_task = asyncio.create_task(_run_graph())
-        keepalive_task = asyncio.create_task(_keepalive())
+        yield {
+            "event": "progress",
+            "data": {"step": f"{day_count}일 상세 병렬 생성 중...", "percent": 50},
+        }
 
-        result = None
-        try:
-            while True:
-                msg_type, msg_data = await event_queue.get()
-                if msg_type == "done":
-                    result = msg_data
-                    break
-                elif msg_type == "error":
-                    raise msg_data
-                elif msg_type == "keepalive":
-                    yield {"event": "progress", "data": {"step": "일정 생성 중...", "percent": msg_data}}
-        finally:
-            keepalive_task.cancel()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
+        async for pct in _stream_keepalive(
+            day_graph,
+            "",
+            invocation_state,
+            base_pct=50,
+            cap_pct=78,
+        ):
+            yield {
+                "event": "progress",
+                "data": {"step": f"{day_count}일 상세 병렬 생성 중...", "percent": pct},
+            }
 
         yield {"event": "progress", "data": {"step": "검증 중...", "percent": 80}}
 
         planning_output_data = invocation_state.get("planning_output")
-
-        from src.models.output import PlanningOutput
-        if planning_output_data and isinstance(planning_output_data, dict) and len(planning_output_data) > 0:
-            output = PlanningOutput(**planning_output_data)
-        else:
-            # Try new 2-phase node names first, then legacy
-            gen_result = (
-                result.results.get("generate_day_details")
-                or result.results.get("generate_itinerary")
-            )
-            validate_result = (
-                result.results.get("validate_day_details")
-                or result.results.get("validate")
-            )
-            target = gen_result or validate_result
-            if target and target.result:
-                output_text = str(target.result)
-                for match in re.finditer(r"\{", output_text):
-                    remainder = output_text[match.start():]
-                    if '"package_name"' not in remainder[:5000]:
-                        continue
-                    depth = 0
-                    for i, ch in enumerate(remainder):
-                        if ch == "{":
-                            depth += 1
-                        elif ch == "}":
-                            depth -= 1
-                            if depth == 0:
-                                try:
-                                    parsed = json.loads(remainder[: i + 1])
-                                    if "package_name" in parsed:
-                                        output = PlanningOutput(**parsed)
-                                        break
-                                except (json.JSONDecodeError, Exception):
-                                    pass
-                                break
-                    else:
-                        continue
-                    break
-                else:
-                    raise RuntimeError("Failed to extract PlanningOutput from graph result")
-            else:
-                raise RuntimeError("No planning output produced by the graph")
+        if not (
+            planning_output_data
+            and isinstance(planning_output_data, dict)
+            and len(planning_output_data) > 0
+        ):
+            raise RuntimeError("Day details stage produced no planning_output")
+        output = PlanningOutput(**planning_output_data)
 
         elapsed = time.time() - start_time
         logger.info("Planning completed in %.2fs", elapsed)
